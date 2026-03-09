@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # ─── Config ────────────────────────────────────────────────
 BOT_TOKEN       = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 ANTHROPIC_KEY   = os.environ.get('ANTHROPIC_API_KEY', '')
-DB_PATH         = os.environ.get('DB_PATH', 'sales_data.db')
+DB_PATH         = os.environ.get('DB_PATH', '/app/data/sales_data.db')
 
 # ─── Database ──────────────────────────────────────────────
 def get_conn():
