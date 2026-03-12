@@ -172,6 +172,13 @@ def set_target(chat_id: int, target_type: str, amount: float):
     conn.commit()
     conn.close()
 
+def delete_target(chat_id: int, target_type: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('DELETE FROM sales_targets WHERE chat_id=? AND target_type=?', (chat_id, target_type))
+    conn.commit()
+    conn.close()
+
 def is_supermarket_report(text: str) -> bool:
     t = text.lower()
     checks = [
@@ -1500,6 +1507,8 @@ def detect_intent(text: str) -> Optional[str]:
         return 'help'
     if '目標設定' in t or '目標を設定' in t or (('目標' in t or 'target' in t) and re.search(r'\d', t)):
         return 'set_target'
+    if '目標' in t and any(k in t for k in ['削除', 'リセット', '取り消し', 'クリア', 'なし', 'reset', 'clear', 'delete']):
+        return 'reset_target'
     if '目標確認' in t or '目標を見' in t or ('目標' in t and ('確認' in t or '見せ' in t or 'show' in t or '教えて' in t)):
         return 'view_target'
     return None
@@ -1647,6 +1656,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sent = await update.message.reply_text(HELP_TEXT)
         save_bot_message(chat_id, sent.message_id)
     elif intent == 'set_target':     await cmd_set_target(update, ctx, text)
+    elif intent == 'reset_target':   await cmd_reset_target(update, ctx, text)
     elif intent == 'view_target':    await cmd_view_target(update, ctx)
     else:
         try:
@@ -1705,6 +1715,20 @@ async def cmd_view_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines.append(f"週次目標: {f'₱{weekly:,.0f}'  if weekly  > 0 else '未設定'}")
     lines.append(f"月間目標: {f'₱{monthly:,.0f}' if monthly > 0 else '未設定'}")
     sent = await update.message.reply_text("\n".join(lines))
+    save_bot_message(chat_id, sent.message_id)
+
+async def cmd_reset_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    chat_id = update.effective_chat.id
+    t = text.lower()
+    if '月' in text or 'month' in t:
+        delete_target(chat_id, 'monthly')
+        sent = await update.message.reply_text("🗑️ 月間目標を削除しました。")
+    elif '週' in text or 'week' in t:
+        delete_target(chat_id, 'weekly')
+        sent = await update.message.reply_text("🗑️ 週次目標を削除しました。")
+    else:
+        delete_target(chat_id, 'daily')
+        sent = await update.message.reply_text("🗑️ 日次目標を削除しました。")
     save_bot_message(chat_id, sent.message_id)
 
 # ─── Main ──────────────────────────────────────────────────
