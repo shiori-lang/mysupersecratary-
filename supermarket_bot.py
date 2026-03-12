@@ -175,25 +175,50 @@ def parse_report(text: str) -> dict:
             raw_line, re.IGNORECASE
         )
         raw_date = date_extract.group(1).strip() if date_extract else raw_line
-        for fmt in (
-            '%m/%d/%Y', '%m/%d/%y',
-            '%m-%d-%Y', '%m-%d-%y',
-            '%m.%d.%Y',
-            '%B %d, %Y', '%B %d %Y',
-            '%B. %d, %Y', '%b %d, %Y', '%b %d %Y',
-            '%d/%m/%Y', '%d/%m/%y',
-            '%d-%m-%Y', '%d-%m-%y',
-            '%d.%m.%Y',
-            '%Y-%m-%d',
-        ):
-            try:
-                d['date'] = datetime.strptime(raw_date, fmt).strftime('%Y-%m-%d')
-                break
-            except ValueError:
-                continue
-        else:
-            d['date'] = raw_date
-            logger.warning(f"Date parse failed: '{raw_date}' from line: '{raw_line}'")
+        today = datetime.now()
+        # Smart MM/DD vs DD/MM disambiguation for slash-separated dates:
+        # when both interpretations are valid (e.g. 03/10/2026), pick the one
+        # closest to today to avoid silently saving the wrong month.
+        _slash = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{4})$', raw_date)
+        if _slash:
+            _a, _b, _yr = int(_slash.group(1)), int(_slash.group(2)), int(_slash.group(3))
+            _candidates = []
+            if 1 <= _a <= 12 and 1 <= _b <= 31:  # MM/DD/YYYY
+                try:
+                    _candidates.append(datetime(_yr, _a, _b))
+                except ValueError:
+                    pass
+            if 1 <= _b <= 12 and 1 <= _a <= 31:  # DD/MM/YYYY
+                try:
+                    _dt = datetime(_yr, _b, _a)
+                    if not _candidates or _dt != _candidates[0]:
+                        _candidates.append(_dt)
+                except ValueError:
+                    pass
+            if _candidates:
+                _best = min(_candidates, key=lambda dt: abs((dt - today).days))
+                d['date'] = _best.strftime('%Y-%m-%d')
+                logger.info(f"Slash date disambiguated to {d['date']} (candidates: {[c.strftime('%Y-%m-%d') for c in _candidates]})")
+        if 'date' not in d:
+            for fmt in (
+                '%m/%d/%Y', '%m/%d/%y',
+                '%m-%d-%Y', '%m-%d-%y',
+                '%m.%d.%Y',
+                '%B %d, %Y', '%B %d %Y',
+                '%B. %d, %Y', '%b %d, %Y', '%b %d %Y',
+                '%d/%m/%Y', '%d/%m/%y',
+                '%d-%m-%Y', '%d-%m-%y',
+                '%d.%m.%Y',
+                '%Y-%m-%d',
+            ):
+                try:
+                    d['date'] = datetime.strptime(raw_date, fmt).strftime('%Y-%m-%d')
+                    break
+                except ValueError:
+                    continue
+            else:
+                d['date'] = raw_date
+                logger.warning(f"Date parse failed: '{raw_date}' from line: '{raw_line}'")
         logger.info(f"Date extracted: '{d.get('date')}' | raw='{raw_date}' | line='{raw_line}'")
     else:
         d['date'] = datetime.now().strftime('%Y-%m-%d')
