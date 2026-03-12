@@ -666,7 +666,7 @@ CAT_LABELS = [
 ]
 
 # ─── Format daily report ───────────────────────────────────
-def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts: list, daily_target: float = 0.0) -> str:
+def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts: list, daily_target: float = 0.0, monthly_target: float = 0.0) -> str:
     total = data['total'] if data['total'] > 0 else 1
     shift_total = data['morning'] + data['afternoon'] + data['graveyard']
     avg_tx = total / data['transaction_count'] if data['transaction_count'] > 0 else 0
@@ -706,7 +706,13 @@ def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts:
 
     monthly_line = ""
     if data['monthly_total'] > 0:
-        monthly_line = f"\n⭐️ 月間累計: ₱{data['monthly_total']:,.0f}"
+        if monthly_target > 0:
+            m_ach    = data['monthly_total'] / monthly_target * 100
+            m_filled = min(int(m_ach // 10), 10)
+            m_bar    = "🟩" * m_filled + "⬜" * (10 - m_filled)
+            monthly_line = f"\n⭐️ 月間累計: ₱{data['monthly_total']:,.0f}  🎯{m_ach:.1f}% {m_bar}"
+        else:
+            monthly_line = f"\n⭐️ 月間累計: ₱{data['monthly_total']:,.0f}"
 
     target_line = ""
     if daily_target > 0:
@@ -1245,12 +1251,20 @@ async def cmd_monthly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sent = await update.message.reply_text("📭 過去30日のデータがまだありません。")
         save_bot_message(chat_id, sent.message_id)
         return
-    total_sum = sum(r['total'] for r in records)
+    total_sum      = sum(r['total'] for r in records)
+    monthly_target = get_target(chat_id, 'monthly')
+    if monthly_target > 0:
+        m_ach    = total_sum / monthly_target * 100
+        m_filled = min(int(m_ach // 10), 10)
+        m_bar    = "🟩" * m_filled + "⬜" * (10 - m_filled)
+        target_block = f"\n🎯 月間目標達成率: {m_ach:.1f}% {m_bar}\n   ₱{total_sum:,.0f} / 目標 ₱{monthly_target:,.0f}"
+    else:
+        target_block = ""
     text = f"""📅 月次レポート（直近30日）
 ━━━━━━━━━━━━━━━━━━━
 💰 総売上: ₱{total_sum:,.0f}
 📊 日平均: ₱{total_sum/len(records):,.0f}
-📆 営業日数: {len(records)}日"""
+📆 営業日数: {len(records)}日{target_block}"""
     s1 = await update.message.reply_text(text)
     save_bot_message(chat_id, s1.message_id)
     s2 = await update.message.reply_photo(photo=make_trend_chart(records, "Monthly Sales Trend"), caption="📈 Sales Trend")
@@ -1486,7 +1500,7 @@ def detect_intent(text: str) -> Optional[str]:
         return 'help'
     if '目標設定' in t or '目標を設定' in t or (('目標' in t or 'target' in t) and re.search(r'\d', t)):
         return 'set_target'
-    if '目標確認' in t or '目標を見' in t or ('目標' in t and ('確認' in t or '見せ' in t or 'show' in t)):
+    if '目標確認' in t or '目標を見' in t or ('目標' in t and ('確認' in t or '見せ' in t or 'show' in t or '教えて' in t)):
         return 'view_target'
     return None
 
@@ -1513,6 +1527,7 @@ HELP_TEXT = """🤖 話しかけてくれてありがとう！
 
 🎯 「日次目標を20000に設定」— 日次目標設定
 🎯 「週次目標150000」— 週次目標設定
+🎯 「月間目標600000」— 月間目標設定
 🎯 「目標確認」— 現在の目標を表示
 
 🗑️ 「最新レポートを削除」— 最新データ削除
@@ -1566,8 +1581,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             save_record(data, text, chat_id)
             alerts       = check_alerts(data, prev)
             comments     = generate_ai_comment(data, prev)
-            daily_target = get_target(chat_id, 'daily')
-            reply        = format_daily_report(data, prev, comments, alerts, daily_target)
+            daily_target   = get_target(chat_id, 'daily')
+            monthly_target = get_target(chat_id, 'monthly')
+            reply          = format_daily_report(data, prev, comments, alerts, daily_target, monthly_target)
             sent = await update.message.reply_text(reply)
             save_bot_message(chat_id, sent.message_id)
         except Exception as e:
@@ -1668,7 +1684,10 @@ async def cmd_set_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: s
         return
     amount = float(amount_m.group(1).replace(',', ''))
     t = text.lower()
-    if '週' in text or 'week' in t:
+    if '月' in text or 'month' in t:
+        set_target(chat_id, 'monthly', amount)
+        sent = await update.message.reply_text(f"✅ 月間目標を ₱{amount:,.0f} に設定しました。")
+    elif '週' in text or 'week' in t:
         set_target(chat_id, 'weekly', amount)
         sent = await update.message.reply_text(f"✅ 週次目標を ₱{amount:,.0f} に設定しました。")
     else:
@@ -1678,11 +1697,13 @@ async def cmd_set_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: s
 
 async def cmd_view_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    daily  = get_target(chat_id, 'daily')
-    weekly = get_target(chat_id, 'weekly')
-    lines  = ["🎯 現在の売上目標"]
-    lines.append(f"日次目標: {f'₱{daily:,.0f}' if daily > 0 else '未設定'}")
-    lines.append(f"週次目標: {f'₱{weekly:,.0f}' if weekly > 0 else '未設定'}")
+    daily   = get_target(chat_id, 'daily')
+    weekly  = get_target(chat_id, 'weekly')
+    monthly = get_target(chat_id, 'monthly')
+    lines   = ["🎯 現在の売上目標"]
+    lines.append(f"日次目標: {f'₱{daily:,.0f}'   if daily   > 0 else '未設定'}")
+    lines.append(f"週次目標: {f'₱{weekly:,.0f}'  if weekly  > 0 else '未設定'}")
+    lines.append(f"月間目標: {f'₱{monthly:,.0f}' if monthly > 0 else '未設定'}")
     sent = await update.message.reply_text("\n".join(lines))
     save_bot_message(chat_id, sent.message_id)
 
