@@ -165,8 +165,15 @@ def parse_report(text: str) -> dict:
 
     m = re.search(r'DATE TODAY\s*:?\s*(.+)', text, re.IGNORECASE)
     if m:
-        raw_date = m.group(1).strip()
-        for fmt in ('%m/%d/%Y', '%m/%d/%y', '%B %d, %Y', '%d/%m/%Y', '%Y-%m-%d'):
+        raw_line = m.group(1).strip()
+        # Extract just the date token — ignore trailing day names, notes, etc.
+        date_extract = re.search(
+            r'(\d{1,2}/\d{1,2}/\d{4}|\d{1,2}/\d{1,2}/\d{2}|\d{4}-\d{2}-\d{2}'
+            r'|[A-Za-z]+\.?\s+\d{1,2},?\s*\d{4})',
+            raw_line, re.IGNORECASE
+        )
+        raw_date = date_extract.group(1).strip() if date_extract else raw_line
+        for fmt in ('%m/%d/%Y', '%m/%d/%y', '%B %d, %Y', '%B. %d, %Y', '%d/%m/%Y', '%Y-%m-%d'):
             try:
                 d['date'] = datetime.strptime(raw_date, fmt).strftime('%Y-%m-%d')
                 break
@@ -174,6 +181,7 @@ def parse_report(text: str) -> dict:
                 continue
         else:
             d['date'] = raw_date
+            logger.warning(f"Date parse failed: '{raw_date}' from line: '{raw_line}'")
     else:
         d['date'] = datetime.now().strftime('%Y-%m-%d')
 
@@ -246,6 +254,13 @@ def save_record(data: dict, raw_text: str, chat_id: int):
         if dup:
             c.execute('DELETE FROM supermarket_sales WHERE date=? AND store=? AND chat_id=?',
                       (data['date'], data['store'], dup[0]))
+    # Detect overwrite: warn if a record for this date already exists
+    c.execute('SELECT id FROM supermarket_sales WHERE date=? AND store=? AND chat_id=?',
+              (data['date'], data['store'], chat_id))
+    _existing = c.fetchone()
+    if _existing:
+        logger.warning(f"Overwriting existing record: {data.get('date')} / {data.get('store')} / chat={chat_id}")
+
     try:
         c.execute('''
             INSERT INTO supermarket_sales
@@ -1381,6 +1396,23 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if is_supermarket_report(text):
         try:
             data     = parse_report(text)
+            # Validate parsed date
+            if not re.match(r'^\d{4}-\d{2}-\d{2}$', data['date']):
+                await update.message.reply_text(
+                    f"⚠️ 日付の読み取りに失敗しました: '{data['date']}'\n"
+                    "DATE TODAY の日付フォーマットを確認してください（例: 03/09/2026）"
+                )
+                return
+            try:
+                _pd = datetime.strptime(data['date'], '%Y-%m-%d')
+                _diff = (datetime.now() - _pd).days
+                if _diff < -1 or _diff > 30:
+                    await update.message.reply_text(
+                        f"⚠️ 日付確認: {data['date']} が本日と{_diff}日ずれています。\n"
+                        "正しい日付かご確認ください。（処理は続行します）"
+                    )
+            except ValueError:
+                pass
             # total と主要フィールドがすべて0の場合
             if data['total'] == 0 and data['cash_sale'] == 0 and data['for_deposit'] == 0:
                 # 本文に3桁以上の数字があればパース失敗→マネージャーに通知
