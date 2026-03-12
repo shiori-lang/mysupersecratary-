@@ -166,14 +166,26 @@ def parse_report(text: str) -> dict:
     m = re.search(r'DATE TODAY\s*:?\s*(.+)', text, re.IGNORECASE)
     if m:
         raw_line = m.group(1).strip()
-        # Extract just the date token — ignore trailing day names, notes, etc.
+        # Extract just the date token — handles /, -, . separators and month names
         date_extract = re.search(
-            r'(\d{1,2}/\d{1,2}/\d{4}|\d{1,2}/\d{1,2}/\d{2}|\d{4}-\d{2}-\d{2}'
+            r'(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{4}'
+            r'|\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2}'
+            r'|\d{4}-\d{2}-\d{2}'
             r'|[A-Za-z]+\.?\s+\d{1,2},?\s*\d{4})',
             raw_line, re.IGNORECASE
         )
         raw_date = date_extract.group(1).strip() if date_extract else raw_line
-        for fmt in ('%m/%d/%Y', '%m/%d/%y', '%B %d, %Y', '%B. %d, %Y', '%d/%m/%Y', '%Y-%m-%d'):
+        for fmt in (
+            '%m/%d/%Y', '%m/%d/%y',
+            '%m-%d-%Y', '%m-%d-%y',
+            '%m.%d.%Y',
+            '%B %d, %Y', '%B %d %Y',
+            '%B. %d, %Y', '%b %d, %Y', '%b %d %Y',
+            '%d/%m/%Y', '%d/%m/%y',
+            '%d-%m-%Y', '%d-%m-%y',
+            '%d.%m.%Y',
+            '%Y-%m-%d',
+        ):
             try:
                 d['date'] = datetime.strptime(raw_date, fmt).strftime('%Y-%m-%d')
                 break
@@ -182,6 +194,7 @@ def parse_report(text: str) -> dict:
         else:
             d['date'] = raw_date
             logger.warning(f"Date parse failed: '{raw_date}' from line: '{raw_line}'")
+        logger.info(f"Date extracted: '{d.get('date')}' | raw='{raw_date}' | line='{raw_line}'")
     else:
         d['date'] = datetime.now().strftime('%Y-%m-%d')
 
@@ -1427,7 +1440,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     )
                 # 数字もなければ空テンプレート→無視
                 return
-            await update.message.reply_text("🔍 レポートを受信しました。分析中...")
+            await update.message.reply_text(f"🔍 レポートを受信しました（日付: {data['date']}）。分析中...")
             prev     = get_previous(data['date'], data['store'], chat_id)
             save_record(data, text, chat_id)
             alerts   = check_alerts(data, prev)
