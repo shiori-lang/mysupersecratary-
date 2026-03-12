@@ -103,8 +103,23 @@ def init_db():
     ''')
     # Migration: add new columns if they don't exist yet
     for col, definition in [
-        ('foodpanda',   'REAL DEFAULT 0'),
-        ('cash_drawer', 'REAL DEFAULT 0'),
+        ('foodpanda',             'REAL DEFAULT 0'),
+        ('cash_drawer',           'REAL DEFAULT 0'),
+        ('cat_instant_food',      'REAL DEFAULT 0'),
+        ('cat_seasoning',         'REAL DEFAULT 0'),
+        ('cat_grabmart',          'REAL DEFAULT 0'),
+        ('cat_frozen_item',       'REAL DEFAULT 0'),
+        ('cat_personal_care',     'REAL DEFAULT 0'),
+        ('cat_beverage',          'REAL DEFAULT 0'),
+        ('cat_snacks_candies',    'REAL DEFAULT 0'),
+        ('cat_chilled_item',      'REAL DEFAULT 0'),
+        ('cat_medicine',          'REAL DEFAULT 0'),
+        ('cat_bento',             'REAL DEFAULT 0'),
+        ('cat_rice_noodle_bread', 'REAL DEFAULT 0'),
+        ('cat_grabfood',          'REAL DEFAULT 0'),
+        ('cat_rte',               'REAL DEFAULT 0'),
+        ('cat_ice_cream',         'REAL DEFAULT 0'),
+        ('cat_bath_item',         'REAL DEFAULT 0'),
     ]:
         try:
             c.execute(f'ALTER TABLE supermarket_sales ADD COLUMN {col} {definition}')
@@ -120,9 +135,24 @@ def _num(text: str, field: str) -> float:
     m = re.search(pattern, text, re.IGNORECASE)
     return float(m.group(1).replace(',', '')) if m else 0.0
 
+def _cat_num(text: str, field: str) -> float:
+    pattern = rf'{re.escape(field)}\s*[–—-]+\s*[₱Pp]?\s*([\d,]+\.?\d*)'
+    m = re.search(pattern, text, re.IGNORECASE)
+    return float(m.group(1).replace(',', '')) if m else 0.0
+
 def is_supermarket_report(text: str) -> bool:
-    keywords = ['PREVIOUS SALES', 'CASH SALE', 'CREDIT/CARD SALE', 'MAYA', 'FOR DEPOSIT']
-    return sum(1 for kw in keywords if kw.lower() in text.lower()) >= 4
+    t = text.lower()
+    checks = [
+        'cash sale' in t,
+        'for deposit' in t,
+        'maya' in t,
+        'card sale' in t or 'credit' in t,
+        'previous sales' in t,
+        'morning' in t,
+        'transaction' in t,
+        'date today' in t,
+    ]
+    return sum(checks) >= 4
 
 def parse_report(text: str) -> dict:
     d = {}
@@ -149,7 +179,7 @@ def parse_report(text: str) -> dict:
 
     d['previous_sales'] = _num(text, 'PREVIOUS SALES')
     d['cash_sale']   = _num(text, 'CASH SALE')
-    d['card_sale']   = _num(text, 'CREDIT/CARD SALE')
+    d['card_sale']   = _num(text, 'CREDIT/CARD SALE') or _num(text, 'CREDIT CARD SALE') or _num(text, 'CARD SALE')
     d['qr_ph']       = _num(text, 'QR PH')
     d['maya']        = _num(text, 'MAYA')
     d['grab']        = _num(text, 'Grab')
@@ -162,7 +192,9 @@ def parse_report(text: str) -> dict:
     d['afternoon']   = _num(text, 'Afternoon Shift')
     d['discounts']   = _num(text, 'Discounts')
     d['wastage']     = _num(text, 'Wastage/Disposal')
-    d['total']       = _num(text, 'TOTAL')
+    # 全体TOTAL：行頭から数スペース以内のTOTAL（カテゴリのダッシュ区切り小計と区別）
+    m_total = re.search(r'^\s{0,6}TOTAL\s*:?\s*[₱Pp]?\s*([\d,]+\.?\d*)', text, re.MULTILINE | re.IGNORECASE)
+    d['total'] = float(m_total.group(1).replace(',', '')) if m_total else 0.0
 
     # Monthly total: MONTHLY SALES or MARCH SALES etc.
     m = re.search(r'(?:MONTHLY|JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)\s+SALES\s*:?\s*[₱]?\s*([\d,]+\.?\d*)', text, re.IGNORECASE)
@@ -179,19 +211,53 @@ def parse_report(text: str) -> dict:
     d['cashbox']       = _num(text, 'CASHBOX CASH')
     d['for_deposit']   = _num(text, 'FOR DEPOSIT')
 
+    d['cat_instant_food']     = _cat_num(text, 'INSTANT FOOD')
+    d['cat_seasoning']        = _cat_num(text, 'SEASONING')
+    d['cat_grabmart']         = _cat_num(text, 'GRABMART')
+    d['cat_frozen_item']      = _cat_num(text, 'FROZEN ITEM')
+    d['cat_personal_care']    = _cat_num(text, 'PERSONAL CARE')
+    d['cat_beverage']         = _cat_num(text, 'BEVERAGE')
+    d['cat_snacks_candies']   = _cat_num(text, 'SNACKS & CANDIES')
+    d['cat_chilled_item']     = _cat_num(text, 'CHILLED ITEM')
+    d['cat_medicine']         = _cat_num(text, 'MEDICINE')
+    d['cat_bento']            = _cat_num(text, 'BENTO')
+    d['cat_rice_noodle_bread']= _cat_num(text, 'RICE NOODLE BREAD')
+    d['cat_grabfood']         = _cat_num(text, 'GRABFOOD')
+    d['cat_rte']              = _cat_num(text, 'RTE')
+    d['cat_ice_cream']        = _cat_num(text, 'ICE CREAM')
+    d['cat_bath_item']        = _cat_num(text, 'BATH ITEM')
+
     return d
 
 # ─── DB helpers ────────────────────────────────────────────
 def save_record(data: dict, raw_text: str, chat_id: int):
     conn = get_conn()
     c = conn.cursor()
+    # Cross-chat deduplication for STORE_GROUP_IDS linked groups
+    # 同じ日付・店舗のレコードが他のリンクグループに存在する場合は削除して新しい方で上書き
+    ids = get_chat_ids(chat_id)
+    if len(ids) > 1:
+        placeholders_dup = ','.join('?' * len(ids))
+        c.execute(
+            f'SELECT chat_id FROM supermarket_sales WHERE date=? AND store=? AND chat_id IN ({placeholders_dup}) AND chat_id != ?',
+            (data['date'], data['store'], *ids, chat_id)
+        )
+        dup = c.fetchone()
+        if dup:
+            c.execute('DELETE FROM supermarket_sales WHERE date=? AND store=? AND chat_id=?',
+                      (data['date'], data['store'], dup[0]))
     c.execute('''
         INSERT INTO supermarket_sales
         (date, store, submitted_by, cash_sale, card_sale, qr_ph, maya, grab,
          foodpanda, graveyard, morning, afternoon, discounts, wastage, total,
          monthly_total, cash_drawer, transaction_count, salary, inventory,
-         other_expense, cashbox, for_deposit, raw_text, chat_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         other_expense, cashbox, for_deposit,
+         cat_instant_food, cat_seasoning, cat_grabmart, cat_frozen_item,
+         cat_personal_care, cat_beverage, cat_snacks_candies, cat_chilled_item,
+         cat_medicine, cat_bento, cat_rice_noodle_bread, cat_grabfood,
+         cat_rte, cat_ice_cream, cat_bath_item,
+         raw_text, chat_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(date, store, chat_id) DO UPDATE SET
             submitted_by=excluded.submitted_by,
             cash_sale=excluded.cash_sale,
@@ -214,6 +280,21 @@ def save_record(data: dict, raw_text: str, chat_id: int):
             other_expense=excluded.other_expense,
             cashbox=excluded.cashbox,
             for_deposit=excluded.for_deposit,
+            cat_instant_food=excluded.cat_instant_food,
+            cat_seasoning=excluded.cat_seasoning,
+            cat_grabmart=excluded.cat_grabmart,
+            cat_frozen_item=excluded.cat_frozen_item,
+            cat_personal_care=excluded.cat_personal_care,
+            cat_beverage=excluded.cat_beverage,
+            cat_snacks_candies=excluded.cat_snacks_candies,
+            cat_chilled_item=excluded.cat_chilled_item,
+            cat_medicine=excluded.cat_medicine,
+            cat_bento=excluded.cat_bento,
+            cat_rice_noodle_bread=excluded.cat_rice_noodle_bread,
+            cat_grabfood=excluded.cat_grabfood,
+            cat_rte=excluded.cat_rte,
+            cat_ice_cream=excluded.cat_ice_cream,
+            cat_bath_item=excluded.cat_bath_item,
             raw_text=excluded.raw_text,
             created_at=CURRENT_TIMESTAMP
     ''', (
@@ -224,6 +305,14 @@ def save_record(data: dict, raw_text: str, chat_id: int):
         data['total'], data['monthly_total'], data.get('cash_drawer', 0),
         data['transaction_count'], data['salary'], data['inventory'],
         data['other_expense'], data['cashbox'], data['for_deposit'],
+        data.get('cat_instant_food', 0), data.get('cat_seasoning', 0),
+        data.get('cat_grabmart', 0), data.get('cat_frozen_item', 0),
+        data.get('cat_personal_care', 0), data.get('cat_beverage', 0),
+        data.get('cat_snacks_candies', 0), data.get('cat_chilled_item', 0),
+        data.get('cat_medicine', 0), data.get('cat_bento', 0),
+        data.get('cat_rice_noodle_bread', 0), data.get('cat_grabfood', 0),
+        data.get('cat_rte', 0), data.get('cat_ice_cream', 0),
+        data.get('cat_bath_item', 0),
         raw_text, chat_id
     ))
     conn.commit()
@@ -376,16 +465,24 @@ def ai_chat(text: str) -> str:
     resp = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1000,
-        system="You are a helpful assistant for a supermarket business. Answer in the same language the user writes in. Be concise and practical.",
+        system="あなたは「みどりのマート」のマネジメントです。店舗運営・売上・スタッフ管理などについて、マネージャーの立場で実践的にアドバイスしてください。ユーザーが書いた言語と同じ言語で回答し、簡潔に答えてください。",
         messages=[{"role": "user", "content": text}]
     )
     return resp.content[0].text.strip()
 
 
 # ─── Alerts ────────────────────────────────────────────────
+def _has_graveyard_shift(date_str: str) -> bool:
+    """金〜日（weekday 4-6）のみGraveyardシフトあり"""
+    try:
+        return datetime.strptime(date_str, '%Y-%m-%d').weekday() >= 4
+    except Exception:
+        return False  # 日付不明の場合はGYシフトなしとみなす
+
 def check_alerts(data: dict, prev: Optional[dict]) -> list:
     alerts = []
     total = data['total'] or 1
+    has_gy = _has_graveyard_shift(data['date'])
 
     if prev and prev['total'] > 0:
         pct = (data['total'] - prev['total']) / prev['total'] * 100
@@ -397,7 +494,8 @@ def check_alerts(data: dict, prev: Optional[dict]) -> list:
             if tx_pct <= -20:
                 alerts.append(f"👥 客数減{tx_pct:+.1f}%：プロモーション検討を推奨")
 
-        if prev.get('graveyard', 0) > 0:
+        # GYアラートは金〜日のみ（月〜木はGraveyardシフトなし）
+        if has_gy and prev.get('graveyard', 0) > 0:
             g_pct = (data['graveyard'] - prev['graveyard']) / prev['graveyard'] * 100
             if g_pct <= -30:
                 alerts.append(f"🌙 Graveyard売上急減{g_pct:+.1f}%：夜間需要の変動確認")
@@ -421,13 +519,32 @@ def generate_ai_comment(data: dict, prev: Optional[dict]) -> str:
             pct = (data['total'] - prev['total']) / prev['total'] * 100
             comp = f"前日比: {pct:+.1f}%"
 
+        has_gy = _has_graveyard_shift(data['date'])
+        shift_note = (
+            "【シフト体制】月〜木: Morning・Afternoonの2シフトのみ。金〜日: Morning・Afternoon・Graveyardの3シフト。"
+            + ("※本日はGraveyardシフトあり（金〜日）。" if has_gy else "※本日はGraveyardシフトなし（月〜木）のため、GY売上0は正常です。")
+        )
+
+        # トップカテゴリ（上位3件）
+        cat_total = sum(data.get(k, 0) for _, k in CAT_LABELS)
+        if cat_total > 0:
+            top_cats = sorted(
+                [(label, data.get(key, 0)) for label, key in CAT_LABELS if data.get(key, 0) > 0],
+                key=lambda x: x[1], reverse=True
+            )[:3]
+            cat_note = "トップカテゴリ: " + ", ".join(f"{l} {v/cat_total*100:.0f}%" for l, v in top_cats)
+        else:
+            cat_note = ""
+
         prompt = f"""売上データを分析し、{data['submitted_by']}さんへの短いコメントを3点、日本語の箇条書きで生成してください。
 ポジティブな点と改善提案を含めてください。コメントのみ返答してください。
+{shift_note}
 
 売上: ₱{total:,.0f} | 取引: {data['transaction_count']}件 | 平均: ₱{total/max(data['transaction_count'],1):,.0f}
 現金比率: {data['cash_sale']/total*100:.1f}% | Grab: {data['grab']/total*100:.1f}% | 廃棄率: {data['wastage']/total*100:.1f}%
 Morning: {data['morning']/shift_total*100 if shift_total>0 else 0:.1f}% | Afternoon: {data['afternoon']/shift_total*100 if shift_total>0 else 0:.1f}% | Graveyard: {data['graveyard']/shift_total*100 if shift_total>0 else 0:.1f}%
-{comp}"""
+{comp}
+{cat_note}"""
 
         resp = client.messages.create(
             model="claude-sonnet-4-20250514",
@@ -438,6 +555,25 @@ Morning: {data['morning']/shift_total*100 if shift_total>0 else 0:.1f}% | Aftern
     except Exception as e:
         logger.error(f"AI comment error: {e}")
         return "・本日もレポートありがとうございます！\n・データを確認しました。"
+
+# ─── Category labels ───────────────────────────────────────
+CAT_LABELS = [
+    ('Instant Food',      'cat_instant_food'),
+    ('Seasoning',         'cat_seasoning'),
+    ('GrabMart',          'cat_grabmart'),
+    ('Frozen Item',       'cat_frozen_item'),
+    ('Personal Care',     'cat_personal_care'),
+    ('Beverage',          'cat_beverage'),
+    ('Snacks & Candies',  'cat_snacks_candies'),
+    ('Chilled Item',      'cat_chilled_item'),
+    ('Medicine',          'cat_medicine'),
+    ('Bento',             'cat_bento'),
+    ('Rice/Noodle/Bread', 'cat_rice_noodle_bread'),
+    ('GrabFood',          'cat_grabfood'),
+    ('RTE',               'cat_rte'),
+    ('Ice Cream',         'cat_ice_cream'),
+    ('Bath Item',         'cat_bath_item'),
+]
 
 # ─── Format daily report ───────────────────────────────────
 def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts: list) -> str:
@@ -457,6 +593,18 @@ def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts:
     alert_block = ""
     if alerts:
         alert_block = "\n🚨 アラート\n" + "\n".join(f"・{a}" for a in alerts) + "\n"
+
+    cat_lines = ""
+    cat_total = sum(data.get(k, 0) for _, k in CAT_LABELS)
+    if cat_total > 0:
+        cat_rows = "\n".join(
+            f"  {label:<20} ₱{data.get(key, 0):>10,.0f} ({data.get(key, 0)/cat_total*100:.1f}%)"
+            for label, key in CAT_LABELS
+            if data.get(key, 0) > 0
+        )
+        cat_block = f"\n【カテゴリ別売上】\n{cat_rows}\n"
+    else:
+        cat_block = ""
 
     foodpanda_line = ""
     if data.get('foodpanda', 0) > 0:
@@ -496,7 +644,7 @@ def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts:
 ━━━━━━━━━━━━━━━━━━━━━━
 {comp_line}💵 レジ現金: ₱{data.get('cash_drawer', 0):,.0f}
 🏦 入金予定: ₱{data['for_deposit']:,.0f}
-{alert_block}
+{alert_block}{cat_block}
 💡 {data['submitted_by']}さんへのコメント
 {comments}""".strip()
 
@@ -701,6 +849,22 @@ async def _send_weekly_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE, re
     wd_avg = sum(r['total'] for r in weekday_recs) / len(weekday_recs) if weekday_recs else 0
     we_avg = sum(r['total'] for r in weekend_recs) / len(weekend_recs) if weekend_recs else 0
 
+    # ── Category breakdown ──
+    cat_weekly_data = [
+        (label, sum(r.get(key, 0) for r in records))
+        for label, key in CAT_LABELS
+    ]
+    cat_weekly_data = [(l, v) for l, v in cat_weekly_data if v > 0]
+    cat_weekly_sum = sum(v for _, v in cat_weekly_data)
+    if cat_weekly_data:
+        sorted_cats = sorted(cat_weekly_data, key=lambda x: x[1], reverse=True)
+        cat_weekly_rows = "\n".join(
+            f"  {label:<22} ₱{val:>10,.0f}  ({val/cat_weekly_sum*100:.1f}%)"
+            for label, val in sorted_cats
+        )
+    else:
+        cat_weekly_rows = "  (データなし / No data)"
+
     # ── Period ──
     start_date = records[0]['date']
     end_date   = records[-1]['date']
@@ -759,7 +923,12 @@ async def _send_weekly_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE, re
 【9. 曜日別パターン分析】
   月〜木平均: ₱{wd_avg:,.0f}
   金〜日平均: ₱{we_avg:,.0f}
-  {'週末の方が高い📈' if we_avg > wd_avg else '平日の方が高い📊'}"""
+  {'週末の方が高い📈' if we_avg > wd_avg else '平日の方が高い📊'}
+
+━━━━━━━━━━━━━━━━━━━━━━
+【10. カテゴリ別売上】
+  カテゴリ               週間合計        比率
+{cat_weekly_rows}"""
 
     sent = await update.message.reply_text(report)
     save_bot_message(chat_id, sent.message_id)
@@ -825,7 +994,12 @@ async def _send_weekly_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE, re
 [9. Weekday Pattern Analysis]
   Mon-Thu Avg: ₱{wd_avg:,.0f}
   Fri-Sun Avg: ₱{we_avg:,.0f}
-  {'Weekends outperform weekdays 📈' if we_avg > wd_avg else 'Weekdays outperform weekends 📊'}"""
+  {'Weekends outperform weekdays 📈' if we_avg > wd_avg else 'Weekdays outperform weekends 📊'}
+
+━━━━━━━━━━━━━━━━━━━━━━
+[10. Category Breakdown]
+  Category              Weekly Total    Share
+{cat_weekly_rows}"""
 
     sent_en = await update.message.reply_text(eng_report)
     save_bot_message(chat_id, sent_en.message_id)
@@ -859,24 +1033,24 @@ Gross Profit: ₱{gross_profit:,.0f} ({pct(gross_profit,total_sum):.1f}%)"""
             max_tokens=500,
             messages=[{"role": "user", "content": prompt}]
         )
-        sent2 = await update.message.reply_text(f"【10. 来週のアクション項目】\n{resp.content[0].text.strip()}")
+        sent2 = await update.message.reply_text(f"【11. 来週のアクション項目】\n{resp.content[0].text.strip()}")
         save_bot_message(chat_id, sent2.message_id)
-        sent2_en = await update.message.reply_text(f"[10. Action Items for Next Week]\n{resp_en.content[0].text.strip()}")
+        sent2_en = await update.message.reply_text(f"[11. Action Items for Next Week]\n{resp_en.content[0].text.strip()}")
         save_bot_message(chat_id, sent2_en.message_id)
     except Exception as e:
         logger.error(f"Weekly AI error: {e}")
 
     # ── Charts ──
     buf1 = make_trend_chart(records, "Weekly Sales Trend")
-    m1 = await update.message.reply_photo(photo=buf1, caption="【11a】日別売上推移")
+    m1 = await update.message.reply_photo(photo=buf1, caption="【12a】日別売上推移")
     save_bot_message(chat_id, m1.message_id)
 
     buf2 = make_shift_chart(records)
-    m2 = await update.message.reply_photo(photo=buf2, caption="【11b】シフト別売上構成")
+    m2 = await update.message.reply_photo(photo=buf2, caption="【12b】シフト別売上構成")
     save_bot_message(chat_id, m2.message_id)
 
     buf3 = make_payment_chart(records)
-    m3 = await update.message.reply_photo(photo=buf3, caption="【11c】決済方法別比率")
+    m3 = await update.message.reply_photo(photo=buf3, caption="【12c】決済方法別比率")
     save_bot_message(chat_id, m3.message_id)
 
     # Weekday avg bar chart
@@ -898,7 +1072,7 @@ Gross Profit: ₱{gross_profit:,.0f} ({pct(gross_profit,total_sum):.1f}%)"""
         plt.savefig(buf4, format='png', dpi=150)
         buf4.seek(0)
         plt.close()
-        m4 = await update.message.reply_photo(photo=buf4, caption="【11d】曜日別平均売上")
+        m4 = await update.message.reply_photo(photo=buf4, caption="【12d】曜日別平均売上")
         save_bot_message(chat_id, m4.message_id)
     except Exception as e:
         logger.error(f"Weekday chart error: {e}")
@@ -915,7 +1089,8 @@ async def cmd_monthly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     records = get_records(chat_id, days=30)
     if not records:
-        await update.message.reply_text("📭 過去30日のデータがまだありません。")
+        sent = await update.message.reply_text("📭 過去30日のデータがまだありません。")
+        save_bot_message(chat_id, sent.message_id)
         return
     total_sum = sum(r['total'] for r in records)
     text = f"""📅 月次レポート（直近30日）
@@ -923,26 +1098,32 @@ async def cmd_monthly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 💰 総売上: ₱{total_sum:,.0f}
 📊 日平均: ₱{total_sum/len(records):,.0f}
 📆 営業日数: {len(records)}日"""
-    await update.message.reply_text(text)
-    await update.message.reply_photo(photo=make_trend_chart(records, "Monthly Sales Trend"), caption="📈 Sales Trend")
-    await update.message.reply_photo(photo=make_shift_chart(records), caption="📊 Sales by Shift")
+    s1 = await update.message.reply_text(text)
+    save_bot_message(chat_id, s1.message_id)
+    s2 = await update.message.reply_photo(photo=make_trend_chart(records, "Monthly Sales Trend"), caption="📈 Sales Trend")
+    save_bot_message(chat_id, s2.message_id)
+    s3 = await update.message.reply_photo(photo=make_shift_chart(records), caption="📊 Sales by Shift")
+    save_bot_message(chat_id, s3.message_id)
 
 async def cmd_compare(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mode: str = 'payment'):
     chat_id = update.effective_chat.id
     records = get_records(chat_id, days=30)
     if not records:
-        await update.message.reply_text("📭 データがまだありません。")
+        sent = await update.message.reply_text("📭 データがまだありません。")
+        save_bot_message(chat_id, sent.message_id)
         return
     if mode == 'shift':
-        await update.message.reply_photo(photo=make_shift_chart(records), caption="📊 Shift Comparison (Last 30 days)")
+        s = await update.message.reply_photo(photo=make_shift_chart(records), caption="📊 Shift Comparison (Last 30 days)")
     else:
-        await update.message.reply_photo(photo=make_payment_chart(records), caption="💳 Payment Comparison (Last 30 days)")
+        s = await update.message.reply_photo(photo=make_payment_chart(records), caption="💳 Payment Comparison (Last 30 days)")
+    save_bot_message(chat_id, s.message_id)
 
 async def cmd_trend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     records = get_records(chat_id, days=30)
     if not records:
-        await update.message.reply_text("📭 データがまだありません。")
+        sent = await update.message.reply_text("📭 データがまだありません。")
+        save_bot_message(chat_id, sent.message_id)
         return
     first_half  = records[:len(records)//2]
     second_half = records[len(records)//2:]
@@ -958,8 +1139,10 @@ async def cmd_trend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 最高売上: ₱{max(r['total'] for r in records):,.0f}（{max(records, key=lambda r: r['total'])['date']}）
 最低売上: ₱{min(r['total'] for r in records):,.0f}（{min(records, key=lambda r: r['total'])['date']}）"""
-    await update.message.reply_text(text)
-    await update.message.reply_photo(photo=make_trend_chart(records, "30-Day Trend"))
+    s1 = await update.message.reply_text(text)
+    save_bot_message(chat_id, s1.message_id)
+    s2 = await update.message.reply_photo(photo=make_trend_chart(records, "30-Day Trend"))
+    save_bot_message(chat_id, s2.message_id)
 
 async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -970,45 +1153,24 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fields = ['date','store','submitted_by','cash_sale','card_sale','qr_ph',
               'maya','grab','foodpanda','graveyard','morning','afternoon',
               'discounts','wastage','total','monthly_total','cash_drawer',
-              'transaction_count','salary','inventory','other_expense','cashbox','for_deposit']
+              'transaction_count','salary','inventory','other_expense','cashbox','for_deposit',
+              'cat_instant_food','cat_seasoning','cat_grabmart','cat_frozen_item',
+              'cat_personal_care','cat_beverage','cat_snacks_candies','cat_chilled_item',
+              'cat_medicine','cat_bento','cat_rice_noodle_bread','cat_grabfood',
+              'cat_rte','cat_ice_cream','cat_bath_item']
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=fields, extrasaction='ignore')
     writer.writeheader()
     writer.writerows(records)
     output.seek(0)
     filename = f"sales_{datetime.now().strftime('%Y%m%d')}.csv"
-    await update.message.reply_document(
+    sent = await update.message.reply_document(
         document=io.BytesIO(output.getvalue().encode('utf-8-sig')),
         filename=filename,
         caption=f"📊 Sales CSV（直近90日 / {len(records)}件）"
     )
+    save_bot_message(chat_id, sent.message_id)
 
-async def cmd_english(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    records = get_records(chat_id, days=7)
-    if not records:
-        await update.message.reply_text("📭 Recent report not found.")
-        return
-    latest = records[-1]
-    try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        prompt = f"""Generate a professional English daily sales report:
-Store: {latest['store']} | Date: {latest['date']} | By: {latest['submitted_by']}
-Total: ₱{latest['total']:,.0f} | Transactions: {latest['transaction_count']}
-Cash: ₱{latest['cash_sale']:,.0f} | Card: ₱{latest['card_sale']:,.0f} | Grab: ₱{latest['grab']:,.0f}
-Morning: ₱{latest['morning']:,.0f} | Afternoon: ₱{latest['afternoon']:,.0f} | Graveyard: ₱{latest['graveyard']:,.0f}
-Discounts: ₱{latest['discounts']:,.0f} | Wastage: ₱{latest['wastage']:,.0f}
-Monthly Total: ₱{latest['monthly_total']:,.0f} | For Deposit: ₱{latest['for_deposit']:,.0f}
-Format as a clear business report with emojis."""
-        resp = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=600,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        await update.message.reply_text(resp.content[0].text.strip())
-    except Exception as e:
-        logger.error(f"English error: {e}")
-        await update.message.reply_text("⚠️ Translation failed. Please try again.")
 
 async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
     chat_id = update.effective_chat.id
@@ -1067,6 +1229,51 @@ async def cmd_delete_bot_messages(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     msg = await update.message.reply_text(f"🗑️ {deleted}件のメッセージを削除しました。" + (f"（{failed}件は削除不可：48時間超）" if failed else ""))
     save_bot_message(chat_id, msg.message_id)
 
+async def cmd_strategy(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    chat_id = update.effective_chat.id
+    records = get_records(chat_id, days=14)
+    if not records:
+        reply = ai_chat(text)
+        sent = await update.message.reply_text(reply)
+        save_bot_message(chat_id, sent.message_id)
+        return
+
+    total_sum  = sum(r['total'] for r in records)
+    avg        = total_sum / len(records)
+    best       = max(records, key=lambda r: r['total'])
+    worst      = min(records, key=lambda r: r['total'])
+    wastage_pct = sum(r['wastage'] for r in records) / total_sum * 100 if total_sum else 0
+    cash_pct    = sum(r['cash_sale'] for r in records) / total_sum * 100 if total_sum else 0
+    grab_pct    = sum(r['grab'] for r in records) / total_sum * 100 if total_sum else 0
+    daily_lines = "\n".join(
+        f"  {r['date']} ₱{r['total']:,.0f}（取引{r['transaction_count']}件）"
+        for r in records
+    )
+
+    data_context = f"""【みどりのマート 直近{len(records)}日の売上データ】
+総売上: ₱{total_sum:,.0f} | 日平均: ₱{avg:,.0f}
+最高日: {best['date']} ₱{best['total']:,.0f}
+最低日: {worst['date']} ₱{worst['total']:,.0f}
+廃棄率: {wastage_pct:.1f}% | 現金比率: {cash_pct:.1f}% | Grab比率: {grab_pct:.1f}%
+シフト体制: 月〜木は2シフト（Morning/Afternoon）、金〜日は3シフト（+Graveyard）
+
+日別実績:
+{daily_lines}"""
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        resp = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            system="あなたは「みどりのマート」のマネジメントです。提供された実際の売上データを根拠に、具体的で実践的なアドバイスをしてください。ユーザーが書いた言語で回答してください。",
+            messages=[{"role": "user", "content": f"{data_context}\n\n質問: {text}"}]
+        )
+        sent = await update.message.reply_text(resp.content[0].text.strip())
+        save_bot_message(chat_id, sent.message_id)
+    except Exception as e:
+        logger.error(f"Strategy AI error: {e}")
+        await update.message.reply_text("⚠️ 分析中にエラーが発生しました。しばらくしてからもう一度お試しください。")
+
 async def cmd_last_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     records, start, end = get_last_week_records(chat_id)
@@ -1078,8 +1285,25 @@ async def cmd_last_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _send_weekly_report(update, ctx, records, label=f"先週（{start} 〜 {end}）")
 
 # ─── Natural language intent detection ────────────────────
+_ADVISORY_KEYWORDS = [
+    '教えて', 'アドバイス', '提案', '戦略', 'どうすれば', 'どうしたら',
+    'どう思う', 'どうしよう', '改善', 'おすすめ', 'ヒント', 'どうやって',
+    'どうすべき', 'どう対応', 'どう考え', 'どうすると', 'どうしたい',
+    'advice', 'suggest', 'strategy', 'recommend', 'how to', 'how should',
+]
+_DATA_KEYWORDS = [
+    '先週', '今週', '今月', '売上', 'レポート', 'データ', '実績', '結果',
+    'last week', 'this week', 'sales', 'report',
+]
+
 def detect_intent(text: str) -> Optional[str]:
     t = text.lower()
+    # 質問・相談 + データ参照 → strategyとしてデータ付きAI回答
+    if any(k in t for k in _ADVISORY_KEYWORDS) and any(k in t for k in _DATA_KEYWORDS):
+        return 'strategy'
+    # 質問・相談のみ → 通常AIチャット
+    if any(k in t for k in _ADVISORY_KEYWORDS):
+        return None
     if any(k in t for k in ['先週', 'last week', '前週']):
         return 'last_week'
     if any(k in t for k in ['今週', 'weekly', 'ウィークリー', '週次', '週レポ']):
@@ -1094,12 +1318,13 @@ def detect_intent(text: str) -> Optional[str]:
         return 'trend'
     if any(k in t for k in ['csv', 'export', 'エクスポート', 'ダウンロード']):
         return 'export'
-    if any(k in t for k in ['英語', 'english', 'translate', '翻訳']):
-        return 'english'
-    if any(k in t for k in ['翻訳開始', 'translate on']):
+    if any(k in t for k in ['翻訳開始', 'translate on']) or (
+            '翻訳' in t and any(k in t for k in ['開始', 'スタート', 'start', 'はじめ', 'オン', ' on'])):
         return 'translate_on'
-    if any(k in t for k in ['翻訳終了', 'translate off']):
+    if any(k in t for k in ['翻訳終了', 'translate off']) or (
+            '翻訳' in t and any(k in t for k in ['終了', 'ストップ', 'stop', 'やめ', 'オフ', 'off'])):
         return 'translate_off'
+
     if any(k in t for k in ['削除', 'delete', '消して', '取り消し']):
         if any(k in t for k in ['メッセージ', 'ボット', 'bot', '発言', '全部', '件']):
             return 'delete_bot'
@@ -1128,7 +1353,7 @@ HELP_TEXT = """🤖 話しかけてくれてありがとう！
 💳 「決済比較」— 決済方法別グラフ
 📈 「トレンド見せて」— 過去30日分析
 📁 「CSVダウンロード」— データ出力
-🇬🇧 「英語にして」— 英語レポート生成
+
 🗑️ 「最新レポートを削除」— 最新データ削除
 🗑️ 「2026-03-08のレポートを削除」— 日付指定削除"""
 
@@ -1142,9 +1367,23 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # 1) 売上レポートの自動検知
     if is_supermarket_report(text):
-        await update.message.reply_text("🔍 レポートを受信しました。分析中...")
         try:
             data     = parse_report(text)
+            # total と主要フィールドがすべて0の場合
+            if data['total'] == 0 and data['cash_sale'] == 0 and data['for_deposit'] == 0:
+                # 本文に3桁以上の数字があればパース失敗→マネージャーに通知
+                if re.search(r'\d{3,}', text):
+                    await update.message.reply_text(
+                        "⚠️ レポートを検知しましたが、数値の読み取りに失敗しました。\n"
+                        "以下を確認してください：\n"
+                        "・TOTAL の行頭にスペースが多すぎないか\n"
+                        "・CASH SALE / FOR DEPOSIT の表記が正しいか\n"
+                        "・DATE TODAY の日付フォーマット（例: 03/11/2026）\n\n"
+                        "問題が解決しない場合はレポートのテキストをそのまま送ってください。"
+                    )
+                # 数字もなければ空テンプレート→無視
+                return
+            await update.message.reply_text("🔍 レポートを受信しました。分析中...")
             prev     = get_previous(data['date'], data['store'], chat_id)
             save_record(data, text, chat_id)
             alerts   = check_alerts(data, prev)
@@ -1164,27 +1403,41 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             sent = await update.message.reply_text("🌐 Translation mode OFF.")
             save_bot_message(chat_id, sent.message_id)
             return
-        try:
-            translated = translate_text(text)
-            sent = await update.message.reply_text(f"🌐 {translated}")
-            save_bot_message(chat_id, sent.message_id)
-        except Exception as e:
-            logger.error(f"Translation error: {e}")
-        return
+        # @メンション付きのコマンドは翻訳せずコマンド処理に回す
+        if is_bot_mentioned(update, ctx) and detect_intent(text) is not None:
+            pass  # fall through to command processing
+        else:
+            try:
+                translated = translate_text(text)
+                sent = await update.message.reply_text(f"🌐 {translated}")
+                save_bot_message(chat_id, sent.message_id)
+            except Exception as e:
+                logger.error(f"Translation error: {e}")
+            return
 
     # 3) Only respond when bot is mentioned
     if not is_bot_mentioned(update, ctx):
         return
 
     intent = detect_intent(text)
-    if   intent == 'last_week':        await cmd_last_week(update, ctx)
+    # レポート系コマンドが検出されても、質問・相談の形なら strategy に上書き
+    if intent in ('last_week', 'weekly', 'monthly', 'trend', 'compare_shift', 'compare_payment'):
+        t = text.lower()
+        is_question = (
+            any(k in t for k in _ADVISORY_KEYWORDS)
+            or '?' in t or '？' in t
+            or bool(re.search(r'[かな][？?]?\s*$', t.strip()))
+        )
+        if is_question:
+            intent = 'strategy'
+    if   intent == 'strategy':         await cmd_strategy(update, ctx, text)
+    elif intent == 'last_week':        await cmd_last_week(update, ctx)
     elif intent == 'weekly':          await cmd_weekly(update, ctx)
     elif intent == 'monthly':         await cmd_monthly(update, ctx)
     elif intent == 'compare_shift':   await cmd_compare(update, ctx, 'shift')
     elif intent == 'compare_payment': await cmd_compare(update, ctx, 'payment')
     elif intent == 'trend':           await cmd_trend(update, ctx)
     elif intent == 'export':          await cmd_export(update, ctx)
-    elif intent == 'english':         await cmd_english(update, ctx)
     elif intent == 'delete':          await cmd_delete(update, ctx, text)
     elif intent == 'delete_bot':      await cmd_delete_bot_messages(update, ctx, text)
     elif intent == 'translate_on':
