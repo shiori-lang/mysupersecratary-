@@ -11,7 +11,7 @@ import sqlite3
 import asyncio
 import logging
 import pathlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime, timezone
 from typing import Optional
 
 import anthropic
@@ -39,6 +39,13 @@ DB_PATH       = os.environ.get('DB_PATH', '/app/data/sales_data.db')
 # Comma-separated chat IDs that share the same store data
 _raw_ids = os.environ.get('STORE_GROUP_IDS', '')
 STORE_GROUP_IDS = [int(x.strip()) for x in _raw_ids.split(',') if x.strip()] if _raw_ids else []
+
+# Auto weekly report target group (set WEEKLY_REPORT_CHAT_ID in Railway env vars)
+_weekly_chat_raw = os.environ.get('WEEKLY_REPORT_CHAT_ID', '')
+WEEKLY_REPORT_CHAT_ID = int(_weekly_chat_raw.strip()) if _weekly_chat_raw.strip() else 0
+
+# Philippines Time (UTC+8) — used for scheduling
+PHT = timezone(timedelta(hours=8))
 
 # DB directory auto-create
 pathlib.Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -101,6 +108,14 @@ def init_db():
             translate INTEGER DEFAULT 0
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS sales_targets (
+            chat_id     INTEGER,
+            target_type TEXT,
+            amount      REAL,
+            PRIMARY KEY (chat_id, target_type)
+        )
+    ''')
     # Migration: add new columns if they don't exist yet
     for col, definition in [
         ('foodpanda',             'REAL DEFAULT 0'),
@@ -139,6 +154,23 @@ def _cat_num(text: str, field: str) -> float:
     pattern = rf'{re.escape(field)}\s*[–—-]+\s*[₱Pp]?\s*([\d,]+\.?\d*)'
     m = re.search(pattern, text, re.IGNORECASE)
     return float(m.group(1).replace(',', '')) if m else 0.0
+
+# ─── Target helpers ────────────────────────────────────────
+def get_target(chat_id: int, target_type: str) -> float:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT amount FROM sales_targets WHERE chat_id=? AND target_type=?', (chat_id, target_type))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0.0
+
+def set_target(chat_id: int, target_type: str, amount: float):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('INSERT OR REPLACE INTO sales_targets (chat_id, target_type, amount) VALUES (?,?,?)',
+              (chat_id, target_type, amount))
+    conn.commit()
+    conn.close()
 
 def is_supermarket_report(text: str) -> bool:
     t = text.lower()
@@ -634,7 +666,7 @@ CAT_LABELS = [
 ]
 
 # ─── Format daily report ───────────────────────────────────
-def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts: list) -> str:
+def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts: list, daily_target: float = 0.0) -> str:
     total = data['total'] if data['total'] > 0 else 1
     shift_total = data['morning'] + data['afternoon'] + data['graveyard']
     avg_tx = total / data['transaction_count'] if data['transaction_count'] > 0 else 0
@@ -676,6 +708,13 @@ def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts:
     if data['monthly_total'] > 0:
         monthly_line = f"\n⭐️ 月間累計: ₱{data['monthly_total']:,.0f}"
 
+    target_line = ""
+    if daily_target > 0:
+        ach = data['total'] / daily_target * 100
+        filled = min(int(ach // 10), 10)
+        bar = "🟩" * filled + "⬜" * (10 - filled)
+        target_line = f"\n🎯 日次目標達成率: {ach:.1f}% {bar}\n   ₱{data['total']:,.0f} / 目標 ₱{daily_target:,.0f}"
+
     return f"""🏪 {data['store']} - 日次分析レポート{monthly_line}{prev_line}
 📅 {data['date']}（{data['submitted_by']}さん提出）
 ━━━━━━━━━━━━━━━━━━━━━━
@@ -704,7 +743,7 @@ def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts:
 🏦 入金予定: ₱{data['for_deposit']:,.0f}
 {alert_block}{cat_block}
 💡 {data['submitted_by']}さんへのコメント
-{comments}""".strip()
+{comments}{target_line}""".strip()
 
 # ─── Chart generators ──────────────────────────────────────
 def make_trend_chart(records: list, title: str = "Sales Trend") -> io.BytesIO:
@@ -779,12 +818,44 @@ def make_shift_chart(records: list) -> io.BytesIO:
     plt.close()
     return buf
 
-# ─── Commands ──────────────────────────────────────────────
-async def _send_weekly_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE, records: list, label: str = "今週（直近7日）"):
-    chat_id = update.effective_chat.id
+def make_category_chart(records: list) -> io.BytesIO:
+    cat_data = [
+        (lbl, sum(r.get(key, 0) for r in records))
+        for lbl, key in CAT_LABELS
+    ]
+    cat_data = [(l, v) for l, v in cat_data if v > 0]
+    if not cat_data:
+        return io.BytesIO()
+    cat_data.sort(key=lambda x: x[1])  # ascending for horizontal bar (smallest at top)
+    labels = [l for l, _ in cat_data]
+    values = [v for _, v in cat_data]
+    total  = sum(values)
+    height = max(4, len(labels) * 0.55)
+    fig, ax = plt.subplots(figsize=(9, height))
+    colors = plt.cm.RdYlGn(np.linspace(0.3, 0.9, len(labels)))  # type: ignore[attr-defined]
+    bars = ax.barh(labels, values, color=colors)
+    ax.set_title('Category Sales Breakdown', fontsize=13, fontweight='bold')
+    ax.set_xlabel('Sales (₱)')
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'₱{x:,.0f}'))
+    for bar, val in zip(bars, values):
+        ax.text(
+            bar.get_width() + total * 0.01,
+            bar.get_y() + bar.get_height() / 2,
+            f'₱{val:,.0f} ({val/total*100:.1f}%)',
+            va='center', fontsize=8
+        )
+    ax.margins(x=0.25)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    return buf
 
+# ─── Commands ──────────────────────────────────────────────
+async def _send_weekly_report(bot, chat_id: int, records: list, label: str = "今週（直近7日）"):
     if not records:
-        sent = await update.message.reply_text(f"📭 {label}のデータがありません。")
+        sent = await bot.send_message(chat_id=chat_id, text=f"📭 {label}のデータがありません。")
         save_bot_message(chat_id, sent.message_id)
         return
 
@@ -994,7 +1065,15 @@ async def _send_weekly_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE, re
   カテゴリ               週間合計        比率
 {cat_weekly_rows}"""
 
-    sent = await update.message.reply_text(report)
+    # ── Weekly target comparison ──
+    weekly_target = get_target(chat_id, 'weekly')
+    if weekly_target > 0:
+        w_ach = total_sum / weekly_target * 100
+        w_filled = min(int(w_ach // 10), 10)
+        w_bar = "🟩" * w_filled + "⬜" * (10 - w_filled)
+        report += f"\n\n🎯 週次目標達成率: {w_ach:.1f}% {w_bar}\n   ₱{total_sum:,.0f} / 目標 ₱{weekly_target:,.0f}"
+
+    sent = await bot.send_message(chat_id=chat_id, text=report)
     save_bot_message(chat_id, sent.message_id)
 
     # ── English version (sections 1-10) ──
@@ -1065,7 +1144,10 @@ async def _send_weekly_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE, re
   Category              Weekly Total    Share
 {cat_weekly_rows}"""
 
-    sent_en = await update.message.reply_text(eng_report)
+    if weekly_target > 0:
+        eng_report += f"\n\n🎯 Weekly Target Achievement: {w_ach:.1f}% {w_bar}\n   ₱{total_sum:,.0f} / Target ₱{weekly_target:,.0f}"
+
+    sent_en = await bot.send_message(chat_id=chat_id, text=eng_report)
     save_bot_message(chat_id, sent_en.message_id)
 
     # ── AI action items ──
@@ -1097,26 +1179,32 @@ Gross Profit: ₱{gross_profit:,.0f} ({pct(gross_profit,total_sum):.1f}%)"""
             max_tokens=500,
             messages=[{"role": "user", "content": prompt}]
         )
-        sent2 = await update.message.reply_text(f"【11. 来週のアクション項目】\n{resp.content[0].text.strip()}")
+        sent2 = await bot.send_message(chat_id=chat_id, text=f"【11. 来週のアクション項目】\n{resp.content[0].text.strip()}")
         save_bot_message(chat_id, sent2.message_id)
-        sent2_en = await update.message.reply_text(f"[11. Action Items for Next Week]\n{resp_en.content[0].text.strip()}")
+        sent2_en = await bot.send_message(chat_id=chat_id, text=f"[11. Action Items for Next Week]\n{resp_en.content[0].text.strip()}")
         save_bot_message(chat_id, sent2_en.message_id)
     except Exception as e:
         logger.error(f"Weekly AI error: {e}")
 
     # ── Charts ──
     buf1 = make_trend_chart(records, "Weekly Sales Trend")
-    m1 = await update.message.reply_photo(photo=buf1, caption="【12a】日別売上推移")
+    m1 = await bot.send_photo(chat_id=chat_id, photo=buf1, caption="【12a】日別売上推移")
     save_bot_message(chat_id, m1.message_id)
 
     buf2 = make_shift_chart(records)
-    m2 = await update.message.reply_photo(photo=buf2, caption="【12b】シフト別売上構成")
+    m2 = await bot.send_photo(chat_id=chat_id, photo=buf2, caption="【12b】シフト別売上構成")
     save_bot_message(chat_id, m2.message_id)
 
     buf3 = make_payment_chart(records)
     if buf3.getbuffer().nbytes > 0:
-        m3 = await update.message.reply_photo(photo=buf3, caption="【12c】決済方法別比率")
+        m3 = await bot.send_photo(chat_id=chat_id, photo=buf3, caption="【12c】決済方法別比率")
         save_bot_message(chat_id, m3.message_id)
+
+    # Category breakdown chart
+    buf_cat = make_category_chart(records)
+    if buf_cat.getbuffer().nbytes > 0:
+        m_cat = await bot.send_photo(chat_id=chat_id, photo=buf_cat, caption="【12d】カテゴリ別売上構成")
+        save_bot_message(chat_id, m_cat.message_id)
 
     # Weekday avg bar chart
     try:
@@ -1138,7 +1226,7 @@ Gross Profit: ₱{gross_profit:,.0f} ({pct(gross_profit,total_sum):.1f}%)"""
         plt.savefig(buf4, format='png', dpi=150)
         buf4.seek(0)
         plt.close()
-        m4 = await update.message.reply_photo(photo=buf4, caption="【12d】曜日別平均売上")
+        m4 = await bot.send_photo(chat_id=chat_id, photo=buf4, caption="【12e】曜日別平均売上")
         save_bot_message(chat_id, m4.message_id)
     except Exception as e:
         logger.error(f"Weekday chart error: {e}")
@@ -1147,7 +1235,7 @@ Gross Profit: ₱{gross_profit:,.0f} ({pct(gross_profit,total_sum):.1f}%)"""
 async def cmd_weekly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     records = get_records(chat_id, days=7)
-    await _send_weekly_report(update, ctx, records, label="今週（直近7日）")
+    await _send_weekly_report(ctx.bot, chat_id, records, label="今週（直近7日）")
 
 
 async def cmd_monthly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1347,7 +1435,7 @@ async def cmd_last_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_bot_message(chat_id, sent.message_id)
         return
     # Reuse cmd_weekly logic but with last week's records
-    await _send_weekly_report(update, ctx, records, label=f"先週（{start} 〜 {end}）")
+    await _send_weekly_report(ctx.bot, chat_id, records, label=f"先週（{start} 〜 {end}）")
 
 # ─── Natural language intent detection ────────────────────
 _ADVISORY_KEYWORDS = [
@@ -1396,6 +1484,10 @@ def detect_intent(text: str) -> Optional[str]:
         return 'delete'
     if any(k in t for k in ['ヘルプ', 'help', '使い方', 'コマンド']):
         return 'help'
+    if '目標設定' in t or '目標を設定' in t or (('目標' in t or 'target' in t) and re.search(r'\d', t)):
+        return 'set_target'
+    if '目標確認' in t or '目標を見' in t or ('目標' in t and ('確認' in t or '見せ' in t or 'show' in t)):
+        return 'view_target'
     return None
 
 def is_bot_mentioned(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1418,6 +1510,10 @@ HELP_TEXT = """🤖 話しかけてくれてありがとう！
 💳 「決済比較」— 決済方法別グラフ
 📈 「トレンド見せて」— 過去30日分析
 📁 「CSVダウンロード」— データ出力
+
+🎯 「日次目標を20000に設定」— 日次目標設定
+🎯 「週次目標150000」— 週次目標設定
+🎯 「目標確認」— 現在の目標を表示
 
 🗑️ 「最新レポートを削除」— 最新データ削除
 🗑️ 「2026-03-08のレポートを削除」— 日付指定削除"""
@@ -1466,11 +1562,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 # 数字もなければ空テンプレート→無視
                 return
             await update.message.reply_text(f"🔍 レポートを受信しました（日付: {data['date']}）。分析中...")
-            prev     = get_previous(data['date'], data['store'], chat_id)
+            prev         = get_previous(data['date'], data['store'], chat_id)
             save_record(data, text, chat_id)
-            alerts   = check_alerts(data, prev)
-            comments = generate_ai_comment(data, prev)
-            reply    = format_daily_report(data, prev, comments, alerts)
+            alerts       = check_alerts(data, prev)
+            comments     = generate_ai_comment(data, prev)
+            daily_target = get_target(chat_id, 'daily')
+            reply        = format_daily_report(data, prev, comments, alerts, daily_target)
             sent = await update.message.reply_text(reply)
             save_bot_message(chat_id, sent.message_id)
         except Exception as e:
@@ -1533,6 +1630,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == 'help':
         sent = await update.message.reply_text(HELP_TEXT)
         save_bot_message(chat_id, sent.message_id)
+    elif intent == 'set_target':     await cmd_set_target(update, ctx, text)
+    elif intent == 'view_target':    await cmd_view_target(update, ctx)
     else:
         try:
             reply_text = ai_chat(text)
@@ -1541,6 +1640,51 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"AI chat error: {e}")
             await update.message.reply_text(HELP_TEXT)
+
+# ─── Scheduled jobs ────────────────────────────────────────
+async def auto_weekly_report_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """Runs every Monday 8:00 AM PHT — sends last 7 days report to WEEKLY_REPORT_CHAT_ID."""
+    if not WEEKLY_REPORT_CHAT_ID:
+        logger.warning("auto_weekly_report_job: WEEKLY_REPORT_CHAT_ID not set, skipping")
+        return
+    records = get_records(WEEKLY_REPORT_CHAT_ID, days=7)
+    if not records:
+        logger.info("auto_weekly_report_job: no records for last 7 days, skipping")
+        return
+    start = records[0]['date']
+    end   = records[-1]['date']
+    logger.info(f"auto_weekly_report_job: sending report for {start} - {end} to {WEEKLY_REPORT_CHAT_ID}")
+    await _send_weekly_report(ctx.bot, WEEKLY_REPORT_CHAT_ID, records, label=f"先週（{start} 〜 {end}）自動レポート")
+
+# ─── Target commands ────────────────────────────────────────
+async def cmd_set_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    chat_id = update.effective_chat.id
+    amount_m = re.search(r'[₱¥]?\s*([\d,]+(?:\.\d+)?)', text)
+    if not amount_m:
+        sent = await update.message.reply_text(
+            "💡 目標設定の例:\n「日次目標を20000に設定」\n「週次目標150000」"
+        )
+        save_bot_message(chat_id, sent.message_id)
+        return
+    amount = float(amount_m.group(1).replace(',', ''))
+    t = text.lower()
+    if '週' in text or 'week' in t:
+        set_target(chat_id, 'weekly', amount)
+        sent = await update.message.reply_text(f"✅ 週次目標を ₱{amount:,.0f} に設定しました。")
+    else:
+        set_target(chat_id, 'daily', amount)
+        sent = await update.message.reply_text(f"✅ 日次目標を ₱{amount:,.0f} に設定しました。")
+    save_bot_message(chat_id, sent.message_id)
+
+async def cmd_view_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    daily  = get_target(chat_id, 'daily')
+    weekly = get_target(chat_id, 'weekly')
+    lines  = ["🎯 現在の売上目標"]
+    lines.append(f"日次目標: {f'₱{daily:,.0f}' if daily > 0 else '未設定'}")
+    lines.append(f"週次目標: {f'₱{weekly:,.0f}' if weekly > 0 else '未設定'}")
+    sent = await update.message.reply_text("\n".join(lines))
+    save_bot_message(chat_id, sent.message_id)
 
 # ─── Main ──────────────────────────────────────────────────
 def main():
@@ -1553,6 +1697,18 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Schedule auto weekly report every Monday 8:00 AM PHT (UTC+8 = UTC 0:00)
+    if WEEKLY_REPORT_CHAT_ID and app.job_queue:
+        app.job_queue.run_daily(
+            auto_weekly_report_job,
+            time=dtime(8, 0, tzinfo=PHT),
+            days=(0,),  # 0 = Monday
+            name='auto_weekly_report',
+        )
+        logger.info(f"Weekly auto-report scheduled: Monday 08:00 PHT → chat_id={WEEKLY_REPORT_CHAT_ID}")
+    elif not WEEKLY_REPORT_CHAT_ID:
+        logger.info("WEEKLY_REPORT_CHAT_ID not set — auto weekly report disabled")
 
     logger.info("Bot started.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
