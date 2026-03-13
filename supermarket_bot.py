@@ -45,6 +45,18 @@ STORE_GROUP_IDS = [int(x.strip()) for x in _raw_ids.split(',') if x.strip()] if 
 _weekly_chat_raw = os.environ.get('WEEKLY_REPORT_CHAT_ID', '')
 WEEKLY_REPORT_CHAT_ID = int(_weekly_chat_raw.strip()) if _weekly_chat_raw.strip() else 0
 
+# Manager Telegram IDs for direct notifications (format: "Name:ID,Name:ID")
+_manager_ids_raw = os.environ.get('MANAGER_IDS', '')
+MANAGER_IDS: dict[str, int] = {}
+for _item in _manager_ids_raw.split(','):
+    _item = _item.strip()
+    if ':' in _item:
+        _name, _tid = _item.rsplit(':', 1)
+        try:
+            MANAGER_IDS[_name.strip()] = int(_tid.strip())
+        except ValueError:
+            pass
+
 # Philippines Time (UTC+8) — used for scheduling
 PHT = timezone(timedelta(hours=8))
 
@@ -1652,6 +1664,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"🔍 レポートを受信しました（日付: {data['date']}）。分析中...")
             prev         = get_previous(data['date'], data['store'], chat_id)
             save_record(data, text, chat_id)
+            await check_sales_anomaly(update.get_bot(), chat_id, data.get('date', ''), data.get('total', 0))
             alerts       = check_alerts(data, prev)
             comments     = generate_ai_comment(data, prev)
             daily_target   = get_daily_target(chat_id, data.get('date', ''))
@@ -1731,7 +1744,89 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             logger.error(f"AI chat error: {e}")
             await update.message.reply_text(HELP_TEXT)
 
+async def _dm_managers(bot, message: str):
+    """Send a direct message to all registered managers. Silently skips failures."""
+    for name, tid in MANAGER_IDS.items():
+        try:
+            await bot.send_message(chat_id=tid, text=message)
+        except Exception as e:
+            logger.warning(f"DM to {name} ({tid}) failed: {e}")
+
+async def check_sales_anomaly(bot, chat_id: int, date_str: str, total: float):
+    """Alert group + DM managers if today's sales deviate ±30% from same weekday last week."""
+    try:
+        report_date      = datetime.strptime(date_str, '%Y-%m-%d')
+        same_day_last_wk = (report_date - timedelta(days=7)).strftime('%Y-%m-%d')
+        conn = get_conn()
+        c    = conn.cursor()
+        ids  = get_chat_ids(chat_id)
+        placeholders = ','.join('?' * len(ids))
+        c.execute(
+            f'SELECT total FROM supermarket_sales WHERE chat_id IN ({placeholders}) AND date=?',
+            (*ids, same_day_last_wk)
+        )
+        row = c.fetchone()
+        conn.close()
+        if not row or row[0] == 0:
+            return
+        prev_total = row[0]
+        diff_pct   = (total - prev_total) / prev_total * 100
+        if abs(diff_pct) < 30:
+            return
+        direction = "📈 高い" if diff_pct > 0 else "📉 低い"
+        dow_jp = ['月', '火', '水', '木', '金', '土', '日'][report_date.weekday()]
+        group_msg = (
+            f"⚠️ 売上異常アラート（{dow_jp}曜日）\n"
+            f"本日 {date_str}：₱{total:,.0f}\n"
+            f"先週同曜日 {same_day_last_wk}：₱{prev_total:,.0f}\n"
+            f"→ {direction}（{diff_pct:+.1f}%）"
+        )
+        await bot.send_message(chat_id=chat_id, text=group_msg)
+        dm_msg = (
+            f"⚠️ Sales Anomaly Alert\n"
+            f"Today ({date_str}): ₱{total:,.0f}\n"
+            f"Same day last week ({same_day_last_wk}): ₱{prev_total:,.0f}\n"
+            f"Difference: {diff_pct:+.1f}% ({direction.split()[1]})"
+        )
+        await _dm_managers(bot, dm_msg)
+    except Exception as e:
+        logger.error(f"check_sales_anomaly error: {e}")
+
 # ─── Scheduled jobs ────────────────────────────────────────
+async def missing_report_reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """Runs every day at 9 PM PHT — alerts if no report submitted today."""
+    if not WEEKLY_REPORT_CHAT_ID:
+        return
+    today = datetime.now(PHT).strftime('%Y-%m-%d')
+    conn  = get_conn()
+    c     = conn.cursor()
+    ids   = get_chat_ids(WEEKLY_REPORT_CHAT_ID)
+    placeholders = ','.join('?' * len(ids))
+    c.execute(
+        f'SELECT COUNT(*) FROM supermarket_sales WHERE chat_id IN ({placeholders}) AND date=?',
+        (*ids, today)
+    )
+    count = c.fetchone()[0]
+    conn.close()
+    if count > 0:
+        logger.info(f"missing_report_reminder: report exists for {today}, skipping")
+        return
+    logger.info(f"missing_report_reminder: no report for {today}, sending alerts")
+    group_msg = (
+        f"⚠️ レポート未提出リマインダー\n"
+        f"本日（{today}）の売上レポートがまだ提出されていません。\n"
+        f"担当マネージャーは本日中に提出をお願いします。"
+    )
+    try:
+        await ctx.bot.send_message(chat_id=WEEKLY_REPORT_CHAT_ID, text=group_msg)
+    except Exception as e:
+        logger.error(f"missing_report_reminder group message error: {e}")
+    await _dm_managers(
+        ctx.bot,
+        f"⚠️ Reminder: Today's ({today}) sales report has not been submitted yet. "
+        f"Please submit it as soon as possible!"
+    )
+
 async def auto_weekly_report_job(ctx: ContextTypes.DEFAULT_TYPE):
     """Runs every Monday 8:00 AM PHT — sends previous Mon–Sun report to WEEKLY_REPORT_CHAT_ID."""
     if not WEEKLY_REPORT_CHAT_ID:
@@ -1840,6 +1935,12 @@ def main():
             name='auto_weekly_report',
         )
         logger.info(f"Weekly auto-report scheduled: Monday 08:00 PHT → chat_id={WEEKLY_REPORT_CHAT_ID}")
+        app.job_queue.run_daily(
+            missing_report_reminder_job,
+            time=dtime(21, 0, tzinfo=PHT),
+            name='missing_report_reminder',
+        )
+        logger.info(f"Missing report reminder scheduled: daily 21:00 PHT → chat_id={WEEKLY_REPORT_CHAT_ID}")
     elif not WEEKLY_REPORT_CHAT_ID:
         logger.info("WEEKLY_REPORT_CHAT_ID not set — auto weekly report disabled")
 
