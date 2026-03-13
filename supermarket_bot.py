@@ -11,6 +11,7 @@ import sqlite3
 import asyncio
 import logging
 import pathlib
+import calendar
 from datetime import datetime, timedelta, time as dtime, timezone
 from typing import Optional
 
@@ -464,6 +465,25 @@ def get_last_week_records(chat_id: int):
     last_sunday = last_monday + timedelta(days=6)
     start = last_monday.strftime('%Y-%m-%d')
     end   = last_sunday.strftime('%Y-%m-%d')
+    conn = get_conn()
+    c = conn.cursor()
+    ids = get_chat_ids(chat_id)
+    placeholders = ','.join('?' * len(ids))
+    c.execute(f'''SELECT * FROM supermarket_sales
+                 WHERE chat_id IN ({placeholders}) AND date>=? AND date<=?
+                 ORDER BY date ASC''', (*ids, start, end))
+    rows = c.fetchall()
+    col_names = [d[0] for d in c.description]
+    conn.close()
+    return [dict(zip(col_names, r)) for r in rows], start, end
+
+def get_month_records(chat_id: int, year: int = None, month: int = None):
+    today = datetime.now()
+    y = year or today.year
+    m = month or today.month
+    start = f'{y:04d}-{m:02d}-01'
+    last_day = calendar.monthrange(y, m)[1]
+    end = min(f'{y:04d}-{m:02d}-{last_day:02d}', today.strftime('%Y-%m-%d'))
     conn = get_conn()
     c = conn.cursor()
     ids = get_chat_ids(chat_id)
@@ -997,18 +1017,18 @@ async def _send_weekly_report(bot, chat_id: int, records: list, label: str = "�
     wd_avg = sum(r['total'] for r in weekday_recs) / len(weekday_recs) if weekday_recs else 0
     we_avg = sum(r['total'] for r in weekend_recs) / len(weekend_recs) if weekend_recs else 0
 
-    # ── Category breakdown ──
+    # ── Category breakdown with WoW trend ──
     cat_weekly_data = [
-        (label, sum(r.get(key, 0) for r in records))
+        (label, sum(r.get(key, 0) for r in records), sum(r.get(key, 0) for r in prev_week))
         for label, key in CAT_LABELS
     ]
-    cat_weekly_data = [(l, v) for l, v in cat_weekly_data if v > 0]
-    cat_weekly_sum = sum(v for _, v in cat_weekly_data)
+    cat_weekly_data = [(l, c, p) for l, c, p in cat_weekly_data if c > 0 or p > 0]
+    cat_weekly_sum = sum(c for _, c, _ in cat_weekly_data)
     if cat_weekly_data:
         sorted_cats = sorted(cat_weekly_data, key=lambda x: x[1], reverse=True)
         cat_weekly_rows = "\n".join(
-            f"  {label:<22} ₱{val:>10,.0f}  ({val/cat_weekly_sum*100:.1f}%)"
-            for label, val in sorted_cats
+            f"  {label:<22} ₱{curr:>10,.0f}  ({pct(curr,cat_weekly_sum):>5.1f}%)  {f'{wow(curr,prev):+.1f}%' if prev > 0 else '─':>7}"
+            for label, curr, prev in sorted_cats
         )
     else:
         cat_weekly_rows = "  (データなし / No data)"
@@ -1075,7 +1095,7 @@ async def _send_weekly_report(bot, chat_id: int, records: list, label: str = "�
 
 ━━━━━━━━━━━━━━━━━━━━━━
 【10. カテゴリ別売上】
-  カテゴリ               週間合計        比率
+  カテゴリ               週間合計        比率     前週比
 {cat_weekly_rows}"""
 
     # ── Weekly target comparison ──
@@ -1154,7 +1174,7 @@ async def _send_weekly_report(bot, chat_id: int, records: list, label: str = "�
 
 ━━━━━━━━━━━━━━━━━━━━━━
 [10. Category Breakdown]
-  Category              Weekly Total    Share
+  Category              Weekly Total    Share    WoW
 {cat_weekly_rows}"""
 
     if weekly_target > 0:
@@ -1253,31 +1273,63 @@ async def cmd_weekly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_monthly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    records = get_records(chat_id, days=30)
+    today = datetime.now()
+    records, month_start, month_end = get_month_records(chat_id)
+    month_label = today.strftime('%Y年%m月')
     if not records:
-        sent = await update.message.reply_text("📭 過去30日のデータがまだありません。")
+        sent = await update.message.reply_text(f"📭 {month_label}のデータがまだありません。")
         save_bot_message(chat_id, sent.message_id)
         return
     total_sum      = sum(r['total'] for r in records)
+    n              = len(records)
+    days_elapsed   = today.day
+    days_in_month  = calendar.monthrange(today.year, today.month)[1]
+    days_remaining = days_in_month - days_elapsed
+    projected      = (total_sum / days_elapsed * days_in_month) if days_elapsed > 0 else 0
     monthly_target = get_target(chat_id, 'monthly')
     if monthly_target > 0:
         m_ach    = total_sum / monthly_target * 100
         m_filled = min(int(m_ach // 10), 10)
         m_bar    = "🟩" * m_filled + "⬜" * (10 - m_filled)
-        target_block = f"\n🎯 月間目標達成率: {m_ach:.1f}% {m_bar}\n   ₱{total_sum:,.0f} / 目標 ₱{monthly_target:,.0f}"
+        needed   = max(monthly_target - total_sum, 0)
+        target_block = (
+            f"\n\n🎯 月間目標達成率: {m_ach:.1f}% {m_bar}"
+            f"\n   ₱{total_sum:,.0f} / 目標 ₱{monthly_target:,.0f}"
+            f"\n   残り {days_remaining}日で ₱{needed:,.0f} 必要"
+        )
     else:
         target_block = ""
-    text = f"""📅 月次レポート（直近30日）
+    # Category breakdown
+    cat_monthly = [
+        (label, sum(r.get(key, 0) for r in records))
+        for label, key in CAT_LABELS
+    ]
+    cat_monthly = sorted([(l, v) for l, v in cat_monthly if v > 0], key=lambda x: x[1], reverse=True)
+    cat_sum = sum(v for _, v in cat_monthly)
+    if cat_monthly:
+        cat_rows = "\n".join(
+            f"  {label:<22} ₱{val:>10,.0f}  ({val/cat_sum*100:.1f}%)"
+            for label, val in cat_monthly
+        )
+        cat_block = f"\n\n【カテゴリ別売上】\n{cat_rows}"
+    else:
+        cat_block = ""
+    text = f"""📅 月次レポート - {month_label}（{month_start} 〜 {month_end}）
 ━━━━━━━━━━━━━━━━━━━
-💰 総売上: ₱{total_sum:,.0f}
-📊 日平均: ₱{total_sum/len(records):,.0f}
-📆 営業日数: {len(records)}日{target_block}"""
+💰 月間売上合計: ₱{total_sum:,.0f}
+📊 日平均: ₱{total_sum/n:,.0f}
+📆 営業日数: {n}日 / {days_elapsed}日経過
+📈 月末予測: ₱{projected:,.0f}{target_block}{cat_block}"""
     s1 = await update.message.reply_text(text)
     save_bot_message(chat_id, s1.message_id)
-    s2 = await update.message.reply_photo(photo=make_trend_chart(records, "Monthly Sales Trend"), caption="📈 Sales Trend")
+    s2 = await update.message.reply_photo(photo=make_trend_chart(records, f"Monthly Sales Trend ({month_label})"), caption="📈 Sales Trend")
     save_bot_message(chat_id, s2.message_id)
     s3 = await update.message.reply_photo(photo=make_shift_chart(records), caption="📊 Sales by Shift")
     save_bot_message(chat_id, s3.message_id)
+    buf_cat = make_category_chart(records)
+    if buf_cat.getbuffer().nbytes > 0:
+        s4 = await update.message.reply_photo(photo=buf_cat, caption="🗂️ Category Breakdown")
+        save_bot_message(chat_id, s4.message_id)
 
 async def cmd_compare(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mode: str = 'payment'):
     chat_id = update.effective_chat.id
@@ -1669,23 +1721,29 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── Scheduled jobs ────────────────────────────────────────
 async def auto_weekly_report_job(ctx: ContextTypes.DEFAULT_TYPE):
-    """Runs every Monday 8:00 AM PHT — sends last 7 days report to WEEKLY_REPORT_CHAT_ID."""
+    """Runs every Monday 8:00 AM PHT — sends previous Mon–Sun report to WEEKLY_REPORT_CHAT_ID."""
     if not WEEKLY_REPORT_CHAT_ID:
         logger.warning("auto_weekly_report_job: WEEKLY_REPORT_CHAT_ID not set, skipping")
         return
-    records = get_records(WEEKLY_REPORT_CHAT_ID, days=7)
-    if not records:
-        logger.info("auto_weekly_report_job: no records for last 7 days, skipping")
-        return
-    start = records[0]['date']
-    end   = records[-1]['date']
-    logger.info(f"auto_weekly_report_job: sending report for {start} - {end} to {WEEKLY_REPORT_CHAT_ID}")
-    await _send_weekly_report(ctx.bot, WEEKLY_REPORT_CHAT_ID, records, label=f"先週（{start} 〜 {end}）自動レポート")
+    try:
+        records, start, end = get_last_week_records(WEEKLY_REPORT_CHAT_ID)
+        if not records:
+            logger.info(f"auto_weekly_report_job: no records for {start} - {end}, skipping")
+            return
+        logger.info(f"auto_weekly_report_job: sending report for {start} - {end} to {WEEKLY_REPORT_CHAT_ID}")
+        await _send_weekly_report(ctx.bot, WEEKLY_REPORT_CHAT_ID, records, label=f"先週（{start} 〜 {end}）自動レポート")
+    except Exception as e:
+        logger.error(f"auto_weekly_report_job failed: {e}")
 
 # ─── Target commands ────────────────────────────────────────
 async def cmd_set_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
     chat_id = update.effective_chat.id
-    amount_m = re.search(r'[₱¥]?\s*([\d,]+(?:\.\d+)?)', text)
+    # Try to find amount after ₱/¥, or after 目標/target keyword, or after を particle
+    amount_m = (
+        re.search(r'[₱¥]\s*([\d,]+(?:\.\d+)?)', text) or
+        re.search(r'(?:目標|target)\D{0,15}?(\d[\d,]+(?:\.\d+)?)', text, re.IGNORECASE) or
+        re.search(r'を\s*([\d,]+(?:\.\d+)?)', text)
+    )
     if not amount_m:
         sent = await update.message.reply_text(
             "💡 目標設定の例:\n「日次目標を20000に設定」\n「週次目標150000」"
