@@ -1778,7 +1778,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"🔍 レポートを受信しました（日付: {data['date']}）。分析中...")
             prev         = get_previous(data['date'], data['store'], chat_id)
             save_record(data, text, chat_id)
-            await check_sales_anomaly(update.get_bot(), chat_id, data.get('date', ''), data.get('total', 0))
+            await check_sales_anomaly(ctx.bot, chat_id, data.get('date', ''), data.get('total', 0))
             alerts       = check_alerts(data, prev)
             comments     = generate_ai_comment(data, prev)
             daily_target   = get_daily_target(chat_id, data.get('date', ''))
@@ -1976,7 +1976,7 @@ async def cmd_set_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: s
     # Try to find amount after ₱/¥, or after 目標/target keyword, or after を particle
     amount_m = (
         re.search(r'[₱¥]\s*([\d,]+(?:\.\d+)?)', text) or
-        re.search(r'(?:目標|target)\D{0,15}?(\d[\d,]+(?:\.\d+)?)', text, re.IGNORECASE) or
+        re.search(r'(?:目標|target)\D{0,15}?([\d,]+(?:\.\d+)?)', text, re.IGNORECASE) or
         re.search(r'を\s*([\d,]+(?:\.\d+)?)', text)
     )
     if not amount_m:
