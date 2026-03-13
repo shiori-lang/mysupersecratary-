@@ -129,6 +129,16 @@ def init_db():
             PRIMARY KEY (chat_id, target_type)
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS shift_schedules (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            date        TEXT NOT NULL,
+            shift       TEXT NOT NULL,
+            manager     TEXT,
+            chat_id     INTEGER,
+            UNIQUE(date, shift, chat_id)
+        )
+    ''')
     # Migration: add new columns if they don't exist yet
     for col, definition in [
         ('foodpanda',             'REAL DEFAULT 0'),
@@ -156,6 +166,79 @@ def init_db():
     conn.commit()
     conn.close()
     logger.info("Database initialized.")
+
+# ─── Shift schedule ────────────────────────────────────────
+def is_manpower_schedule(text: str) -> bool:
+    return bool(re.search(r'manpower\s+schedule', text, re.IGNORECASE))
+
+def parse_manpower_schedule(text: str) -> dict:
+    """Return {'date': 'YYYY-MM-DD', 'graveyard': name, 'morning': name, 'afternoon': name}."""
+    result = {}
+    # Date
+    date_m = re.search(
+        r'(January|February|March|April|May|June|July|August|September|October|November|December)'
+        r'\s+(\d{1,2})\s*,?\s*(\d{4})', text, re.IGNORECASE
+    )
+    if date_m:
+        try:
+            result['date'] = datetime.strptime(
+                f"{date_m.group(1)} {date_m.group(2)} {date_m.group(3)}", '%B %d %Y'
+            ).strftime('%Y-%m-%d')
+        except ValueError:
+            result['date'] = datetime.now().strftime('%Y-%m-%d')
+    else:
+        result['date'] = datetime.now().strftime('%Y-%m-%d')
+    # Manager/OIC per shift
+    for shift_key, patterns in [
+        ('graveyard', [r'graveyard.*?(?:OIC|Team Lead|Manager)\s*[:/]?\s*([A-Za-z ]+)']),
+        ('morning',   [r'morning.*?Manager\s*[:/]?\s*([A-Za-z ]+)']),
+        ('afternoon', [r'afternoon.*?Manager\s*[:/]?\s*([A-Za-z ]+)']),
+    ]:
+        for pat in patterns:
+            m = re.search(pat, text, re.IGNORECASE | re.DOTALL)
+            if m:
+                name = m.group(1).strip().split('\n')[0].strip()
+                result[shift_key] = name
+                break
+    return result
+
+def save_shift_schedule(parsed: dict, chat_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    date = parsed.get('date', datetime.now().strftime('%Y-%m-%d'))
+    for shift in ('graveyard', 'morning', 'afternoon'):
+        manager = parsed.get(shift)
+        if manager:
+            c.execute(
+                'INSERT OR REPLACE INTO shift_schedules (date, shift, manager, chat_id) VALUES (?,?,?,?)',
+                (date, shift, manager, chat_id)
+            )
+    conn.commit()
+    conn.close()
+
+def get_last_shift_manager(date: str, chat_id: int) -> Optional[str]:
+    """Return the afternoon shift manager name for the given date."""
+    conn = get_conn()
+    c = conn.cursor()
+    ids = get_chat_ids(chat_id)
+    placeholders = ','.join('?' * len(ids))
+    c.execute(
+        f'SELECT manager FROM shift_schedules WHERE chat_id IN ({placeholders}) AND date=? AND shift=?',
+        (*ids, date, 'afternoon')
+    )
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def find_manager_id(name: str) -> Optional[int]:
+    """Match a manager name to a Telegram ID from MANAGER_IDS (partial name match)."""
+    name_lower = name.lower()
+    name_parts = name_lower.split()
+    for key, tid in MANAGER_IDS.items():
+        key_lower = key.lower()
+        if key_lower in name_lower or any(part in key_lower for part in name_parts):
+            return tid
+    return None
 
 # ─── Parser ────────────────────────────────────────────────
 def _num(text: str, field: str) -> float:
@@ -1626,6 +1709,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text    = update.message.text
     chat_id = update.effective_chat.id
 
+    # 0) シフトスケジュールの自動検知
+    if is_manpower_schedule(text):
+        parsed = parse_manpower_schedule(text)
+        save_shift_schedule(parsed, chat_id)
+        lines = [f"📋 シフトスケジュールを記録しました（{parsed.get('date', '?')}）"]
+        for shift, label in [('graveyard', 'Graveyard'), ('morning', 'Morning'), ('afternoon', 'Afternoon')]:
+            if parsed.get(shift):
+                lines.append(f"  {label}: {parsed[shift]}")
+        sent = await update.message.reply_text("\n".join(lines))
+        save_bot_message(chat_id, sent.message_id)
+        return
+
     # 1) 売上レポートの自動検知
     if is_supermarket_report(text):
         try:
@@ -1822,11 +1917,24 @@ async def missing_report_reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
         await ctx.bot.send_message(chat_id=WEEKLY_REPORT_CHAT_ID, text=group_msg)
     except Exception as e:
         logger.error(f"missing_report_reminder group message error: {e}")
-    await _dm_managers(
-        ctx.bot,
-        f"⚠️ Reminder: Yesterday's ({yesterday}) sales report has not been submitted yet. "
-        f"Please submit it as soon as possible!"
-    )
+    # DM only the afternoon shift manager for yesterday
+    manager_name = get_last_shift_manager(yesterday, WEEKLY_REPORT_CHAT_ID)
+    if manager_name:
+        tid = find_manager_id(manager_name)
+        if tid:
+            try:
+                await ctx.bot.send_message(
+                    chat_id=tid,
+                    text=f"⚠️ {manager_name}, yesterday's ({yesterday}) sales report has not been submitted. "
+                         f"Please submit it as soon as possible!"
+                )
+                logger.info(f"missing_report_reminder: DM sent to {manager_name} ({tid})")
+            except Exception as e:
+                logger.error(f"missing_report_reminder DM to {manager_name} failed: {e}")
+        else:
+            logger.warning(f"missing_report_reminder: no Telegram ID found for manager '{manager_name}'")
+    else:
+        logger.warning(f"missing_report_reminder: no afternoon shift manager recorded for {yesterday}")
 
 async def auto_weekly_report_job(ctx: ContextTypes.DEFAULT_TYPE):
     """Runs every Monday 8:00 AM PHT — sends previous Mon–Sun report to WEEKLY_REPORT_CHAT_ID."""
