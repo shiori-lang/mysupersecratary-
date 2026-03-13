@@ -62,6 +62,10 @@ for _item in _manager_ids_raw.split(','):
 _schedule_reply_raw = os.environ.get('SCHEDULE_REPLY_CHAT_ID', '')
 SCHEDULE_REPLY_CHAT_ID = int(_schedule_reply_raw.strip()) if _schedule_reply_raw.strip() else 0
 
+# Owner's personal chat ID for private reports (set OWNER_CHAT_ID in Railway env vars)
+_owner_chat_raw = os.environ.get('OWNER_CHAT_ID', '')
+OWNER_CHAT_ID = int(_owner_chat_raw.strip()) if _owner_chat_raw.strip() else 0
+
 # Philippines Time (UTC+8) — used for scheduling
 PHT = timezone(timedelta(hours=8))
 
@@ -618,6 +622,32 @@ def get_month_records(chat_id: int, year: int = None, month: int = None):
     col_names = [d[0] for d in c.description]
     conn.close()
     return [dict(zip(col_names, r)) for r in rows], start, end
+
+def get_staff_performance(chat_id: int, year: int, month: int) -> list:
+    """Return per-staff stats for the given month, sorted by total sales desc."""
+    records, _, _ = get_month_records(chat_id, year, month)
+    stats: dict[str, dict] = {}
+    for r in records:
+        name = r.get('submitted_by') or 'Unknown'
+        if name not in stats:
+            stats[name] = {'reports': 0, 'total': 0.0, 'best': 0.0, 'best_date': ''}
+        s = stats[name]
+        s['reports'] += 1
+        s['total']   += r['total']
+        if r['total'] > s['best']:
+            s['best']      = r['total']
+            s['best_date'] = r['date']
+    result = []
+    for name, s in stats.items():
+        result.append({
+            'name':      name,
+            'reports':   s['reports'],
+            'total':     s['total'],
+            'avg':       s['total'] / s['reports'] if s['reports'] > 0 else 0,
+            'best':      s['best'],
+            'best_date': s['best_date'],
+        })
+    return sorted(result, key=lambda x: x['total'], reverse=True)
 
 def delete_record_db(date: str, store: str, chat_id: int) -> bool:
     conn = get_conn()
@@ -1955,6 +1985,92 @@ async def missing_report_reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
     else:
         logger.warning(f"missing_report_reminder: no afternoon shift manager recorded for {yesterday}")
 
+async def auto_monthly_report_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """Runs daily at 8:00 AM PHT — on 1st of month, sends previous month's report to group."""
+    now = datetime.now(PHT)
+    if now.day != 1:
+        return
+    if not WEEKLY_REPORT_CHAT_ID:
+        return
+    # Previous month
+    prev_month = now.month - 1 or 12
+    prev_year  = now.year if now.month > 1 else now.year - 1
+    month_label = datetime(prev_year, prev_month, 1).strftime('%Y年%m月')
+    try:
+        records, start, end = get_month_records(WEEKLY_REPORT_CHAT_ID, prev_year, prev_month)
+        if not records:
+            await ctx.bot.send_message(chat_id=WEEKLY_REPORT_CHAT_ID,
+                                       text=f"📭 {month_label}のデータがありません。")
+            return
+        total_sum     = sum(r['total'] for r in records)
+        n             = len(records)
+        days_in_month = calendar.monthrange(prev_year, prev_month)[1]
+        monthly_target = get_target(WEEKLY_REPORT_CHAT_ID, 'monthly')
+        target_line = ""
+        if monthly_target > 0:
+            ach     = total_sum / monthly_target * 100
+            filled  = min(int(ach // 10), 10)
+            bar     = "🟩" * filled + "⬜" * (10 - filled)
+            target_line = f"\n🎯 目標達成率: {ach:.1f}% {bar}\n   ₱{total_sum:,.0f} / 目標 ₱{monthly_target:,.0f}"
+        cat_data = sorted(
+            [(lbl, sum(r.get(key, 0) for r in records)) for lbl, key in CAT_LABELS if sum(r.get(key, 0) for r in records) > 0],
+            key=lambda x: x[1], reverse=True
+        )
+        cat_sum = sum(v for _, v in cat_data)
+        cat_rows = "\n".join(
+            f"  {lbl:<22} ₱{val:>10,.0f}  ({val/cat_sum*100:.1f}%)"
+            for lbl, val in cat_data[:5]
+        ) if cat_data else "  (データなし)"
+        report = (
+            f"📅 {month_label} 月次レポート（自動）\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 月間売上合計: ₱{total_sum:,.0f}\n"
+            f"📊 日平均: ₱{total_sum/n:,.0f}\n"
+            f"📆 営業日数: {n}日 / {days_in_month}日{target_line}\n\n"
+            f"【TOP5 カテゴリ】\n{cat_rows}"
+        )
+        await ctx.bot.send_message(chat_id=WEEKLY_REPORT_CHAT_ID, text=report)
+        buf = make_trend_chart(records, f"Monthly Sales Trend ({month_label})")
+        await ctx.bot.send_photo(chat_id=WEEKLY_REPORT_CHAT_ID, photo=buf, caption="📈 Monthly Trend")
+        buf_cat = make_category_chart(records)
+        if buf_cat.getbuffer().nbytes > 0:
+            await ctx.bot.send_photo(chat_id=WEEKLY_REPORT_CHAT_ID, photo=buf_cat, caption="🗂️ Category Breakdown")
+        logger.info(f"auto_monthly_report_job: sent {month_label} report to {WEEKLY_REPORT_CHAT_ID}")
+    except Exception as e:
+        logger.error(f"auto_monthly_report_job failed: {e}")
+
+async def auto_staff_performance_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """Runs daily at 8:00 AM PHT — on 1st of month, sends staff performance to OWNER_CHAT_ID."""
+    now = datetime.now(PHT)
+    if now.day != 1:
+        return
+    if not OWNER_CHAT_ID or not WEEKLY_REPORT_CHAT_ID:
+        return
+    prev_month = now.month - 1 or 12
+    prev_year  = now.year if now.month > 1 else now.year - 1
+    month_label = datetime(prev_year, prev_month, 1).strftime('%Y年%m月')
+    try:
+        staff = get_staff_performance(WEEKLY_REPORT_CHAT_ID, prev_year, prev_month)
+        if not staff:
+            await ctx.bot.send_message(chat_id=OWNER_CHAT_ID,
+                                       text=f"📭 {month_label}のスタッフデータがありません。")
+            return
+        total_month = sum(s['total'] for s in staff)
+        lines = [f"👥 {month_label} スタッフ別パフォーマンス\n━━━━━━━━━━━━━━━━━━━"]
+        medals = ["🥇", "🥈", "🥉"]
+        for i, s in enumerate(staff):
+            medal = medals[i] if i < 3 else "  "
+            share = s['total'] / total_month * 100 if total_month > 0 else 0
+            lines.append(
+                f"{medal} {s['name']}\n"
+                f"   提出: {s['reports']}回 | 合計: ₱{s['total']:,.0f} ({share:.1f}%)\n"
+                f"   日平均: ₱{s['avg']:,.0f} | 最高: ₱{s['best']:,.0f}（{s['best_date']}）"
+            )
+        await ctx.bot.send_message(chat_id=OWNER_CHAT_ID, text="\n\n".join(lines))
+        logger.info(f"auto_staff_performance_job: sent {month_label} to owner {OWNER_CHAT_ID}")
+    except Exception as e:
+        logger.error(f"auto_staff_performance_job failed: {e}")
+
 async def auto_weekly_report_job(ctx: ContextTypes.DEFAULT_TYPE):
     """Runs every Monday 8:00 AM PHT — sends previous Mon–Sun report to WEEKLY_REPORT_CHAT_ID."""
     if not WEEKLY_REPORT_CHAT_ID:
@@ -2069,6 +2185,18 @@ def main():
             name='missing_report_reminder',
         )
         logger.info(f"Missing report reminder scheduled: daily 00:15 PHT → chat_id={WEEKLY_REPORT_CHAT_ID}")
+        # Monthly auto-report + staff performance (fire daily at 8am, jobs check if day==1)
+        app.job_queue.run_daily(
+            auto_monthly_report_job,
+            time=dtime(8, 0, tzinfo=PHT),
+            name='auto_monthly_report',
+        )
+        app.job_queue.run_daily(
+            auto_staff_performance_job,
+            time=dtime(8, 0, tzinfo=PHT),
+            name='auto_staff_performance',
+        )
+        logger.info("Monthly report + staff performance scheduled: 1st of month 08:00 PHT")
     elif not WEEKLY_REPORT_CHAT_ID:
         logger.info("WEEKLY_REPORT_CHAT_ID not set — auto weekly report disabled")
 
