@@ -57,6 +57,11 @@ for _item in _manager_ids_raw.split(','):
         except ValueError:
             pass
 
+# Group that receives shift schedule confirmation replies
+# If not set, falls back to WEEKLY_REPORT_CHAT_ID
+_schedule_reply_raw = os.environ.get('SCHEDULE_REPLY_CHAT_ID', '')
+SCHEDULE_REPLY_CHAT_ID = int(_schedule_reply_raw.strip()) if _schedule_reply_raw.strip() else 0
+
 # Philippines Time (UTC+8) — used for scheduling
 PHT = timezone(timedelta(hours=8))
 
@@ -231,12 +236,23 @@ def get_last_shift_manager(date: str, chat_id: int) -> Optional[str]:
     return row[0] if row else None
 
 def find_manager_id(name: str) -> Optional[int]:
-    """Match a manager name to a Telegram ID from MANAGER_IDS (partial name match)."""
+    """Match a manager name to a Telegram ID from MANAGER_IDS.
+    Case-insensitive. Matches if either string is a substring of the other,
+    or if any word-pair is a prefix match (handles 'Vince' ↔ 'Vincente').
+    """
     name_lower = name.lower()
     name_parts = name_lower.split()
     for key, tid in MANAGER_IDS.items():
         key_lower = key.lower()
-        if key_lower in name_lower or any(part in key_lower for part in name_parts):
+        key_parts = key_lower.split()
+        # Substring match in either direction
+        if key_lower in name_lower or name_lower in key_lower:
+            return tid
+        # Word-level prefix match (e.g., "vince" matches "vincente")
+        if any(
+            kp.startswith(np) or np.startswith(kp)
+            for kp in key_parts for np in name_parts
+        ):
             return tid
     return None
 
@@ -1713,12 +1729,15 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if is_manpower_schedule(text):
         parsed = parse_manpower_schedule(text)
         save_shift_schedule(parsed, chat_id)
-        lines = [f"📋 シフトスケジュールを記録しました（{parsed.get('date', '?')}）"]
-        for shift, label in [('graveyard', 'Graveyard'), ('morning', 'Morning'), ('afternoon', 'Afternoon')]:
-            if parsed.get(shift):
-                lines.append(f"  {label}: {parsed[shift]}")
-        sent = await update.message.reply_text("\n".join(lines))
-        save_bot_message(chat_id, sent.message_id)
+        # Only reply in the designated group (or WEEKLY_REPORT_CHAT_ID as fallback)
+        reply_chat = SCHEDULE_REPLY_CHAT_ID or WEEKLY_REPORT_CHAT_ID
+        if reply_chat == 0 or chat_id == reply_chat:
+            lines = [f"📋 シフトスケジュールを記録しました（{parsed.get('date', '?')}）"]
+            for shift, label in [('graveyard', 'Graveyard'), ('morning', 'Morning'), ('afternoon', 'Afternoon')]:
+                if parsed.get(shift):
+                    lines.append(f"  {label}: {parsed[shift]}")
+            sent = await update.message.reply_text("\n".join(lines))
+            save_bot_message(chat_id, sent.message_id)
         return
 
     # 1) 売上レポートの自動検知
