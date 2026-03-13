@@ -1794,28 +1794,29 @@ async def check_sales_anomaly(bot, chat_id: int, date_str: str, total: float):
 
 # ─── Scheduled jobs ────────────────────────────────────────
 async def missing_report_reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
-    """Runs every day at 9 PM PHT — alerts if no report submitted today."""
+    """Runs daily at 00:15 PHT — alerts if no report submitted for yesterday."""
     if not WEEKLY_REPORT_CHAT_ID:
         return
-    today = datetime.now(PHT).strftime('%Y-%m-%d')
+    # At 00:15 the calendar has just rolled over, so check yesterday
+    yesterday = (datetime.now(PHT) - timedelta(days=1)).strftime('%Y-%m-%d')
     conn  = get_conn()
     c     = conn.cursor()
     ids   = get_chat_ids(WEEKLY_REPORT_CHAT_ID)
     placeholders = ','.join('?' * len(ids))
     c.execute(
         f'SELECT COUNT(*) FROM supermarket_sales WHERE chat_id IN ({placeholders}) AND date=?',
-        (*ids, today)
+        (*ids, yesterday)
     )
     count = c.fetchone()[0]
     conn.close()
     if count > 0:
-        logger.info(f"missing_report_reminder: report exists for {today}, skipping")
+        logger.info(f"missing_report_reminder: report exists for {yesterday}, skipping")
         return
-    logger.info(f"missing_report_reminder: no report for {today}, sending alerts")
+    logger.info(f"missing_report_reminder: no report for {yesterday}, sending alerts")
     group_msg = (
         f"⚠️ レポート未提出リマインダー\n"
-        f"本日（{today}）の売上レポートがまだ提出されていません。\n"
-        f"担当マネージャーは本日中に提出をお願いします。"
+        f"昨日（{yesterday}）の売上レポートがまだ提出されていません。\n"
+        f"担当マネージャーは早急に提出をお願いします。"
     )
     try:
         await ctx.bot.send_message(chat_id=WEEKLY_REPORT_CHAT_ID, text=group_msg)
@@ -1823,7 +1824,7 @@ async def missing_report_reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
         logger.error(f"missing_report_reminder group message error: {e}")
     await _dm_managers(
         ctx.bot,
-        f"⚠️ Reminder: Today's ({today}) sales report has not been submitted yet. "
+        f"⚠️ Reminder: Yesterday's ({yesterday}) sales report has not been submitted yet. "
         f"Please submit it as soon as possible!"
     )
 
@@ -1937,10 +1938,10 @@ def main():
         logger.info(f"Weekly auto-report scheduled: Monday 08:00 PHT → chat_id={WEEKLY_REPORT_CHAT_ID}")
         app.job_queue.run_daily(
             missing_report_reminder_job,
-            time=dtime(21, 0, tzinfo=PHT),
+            time=dtime(0, 15, tzinfo=PHT),
             name='missing_report_reminder',
         )
-        logger.info(f"Missing report reminder scheduled: daily 21:00 PHT → chat_id={WEEKLY_REPORT_CHAT_ID}")
+        logger.info(f"Missing report reminder scheduled: daily 00:15 PHT → chat_id={WEEKLY_REPORT_CHAT_ID}")
     elif not WEEKLY_REPORT_CHAT_ID:
         logger.info("WEEKLY_REPORT_CHAT_ID not set — auto weekly report disabled")
 
