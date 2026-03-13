@@ -63,8 +63,12 @@ _schedule_reply_raw = os.environ.get('SCHEDULE_REPLY_CHAT_ID', '')
 SCHEDULE_REPLY_CHAT_ID = int(_schedule_reply_raw.strip()) if _schedule_reply_raw.strip() else 0
 
 # Owner's personal chat ID for private reports (set OWNER_CHAT_ID in Railway env vars)
-_owner_chat_raw = os.environ.get('OWNER_CHAT_ID', '')
-OWNER_CHAT_ID = int(_owner_chat_raw.strip()) if _owner_chat_raw.strip() else 0
+_owner_chat_raw = os.environ.get('OWNER_CHAT_ID', '').strip()
+try:
+    OWNER_CHAT_ID = int(_owner_chat_raw) if _owner_chat_raw else 0
+except ValueError:
+    OWNER_CHAT_ID = 0
+    print(f"WARNING: OWNER_CHAT_ID='{_owner_chat_raw}' is not a numeric ID — must be a number, not a username")
 
 # Philippines Time (UTC+8) — used for scheduling
 PHT = timezone(timedelta(hours=8))
