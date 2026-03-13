@@ -180,6 +180,18 @@ def delete_target(chat_id: int, target_type: str):
     conn.commit()
     conn.close()
 
+def get_daily_target(chat_id: int, date_str: str) -> float:
+    """Return the day-of-week-specific daily target, falling back to generic 'daily'."""
+    try:
+        wd = datetime.strptime(date_str, '%Y-%m-%d').weekday()  # 0=Mon … 6=Sun
+    except ValueError:
+        wd = datetime.now().weekday()
+    if wd <= 3:   target_type = 'daily_mon_thu'   # Mon-Thu
+    elif wd == 4: target_type = 'daily_fri'        # Fri
+    else:         target_type = 'daily_sat_sun'    # Sat-Sun
+    v = get_target(chat_id, target_type)
+    return v if v > 0 else get_target(chat_id, 'daily')
+
 def is_supermarket_report(text: str) -> bool:
     t = text.lower()
     checks = [
@@ -1642,7 +1654,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             save_record(data, text, chat_id)
             alerts       = check_alerts(data, prev)
             comments     = generate_ai_comment(data, prev)
-            daily_target   = get_target(chat_id, 'daily')
+            daily_target   = get_daily_target(chat_id, data.get('date', ''))
             monthly_target = get_target(chat_id, 'monthly')
             reply          = format_daily_report(data, prev, comments, alerts, daily_target, monthly_target)
             sent = await update.message.reply_text(reply)
@@ -1752,7 +1764,17 @@ async def cmd_set_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: s
         return
     amount = float(amount_m.group(1).replace(',', ''))
     t = text.lower()
-    if '月' in text or 'month' in t:
+    # Day-of-week specific targets
+    if any(k in text for k in ['月〜木', '月木', '月曜', '平日']) or re.search(r'月.{0,3}木', text):
+        set_target(chat_id, 'daily_mon_thu', amount)
+        sent = await update.message.reply_text(f"✅ 日次目標（月〜木）を ₱{amount:,.0f} に設定しました。")
+    elif any(k in text for k in ['金曜', '金日', '金のみ', 'friday']) or re.search(r'^金', text):
+        set_target(chat_id, 'daily_fri', amount)
+        sent = await update.message.reply_text(f"✅ 日次目標（金曜日）を ₱{amount:,.0f} に設定しました。")
+    elif any(k in text for k in ['土日', '週末', '土曜', '日曜', 'weekend', 'saturday', 'sunday']):
+        set_target(chat_id, 'daily_sat_sun', amount)
+        sent = await update.message.reply_text(f"✅ 日次目標（土・日）を ₱{amount:,.0f} に設定しました。")
+    elif any(k in text for k in ['月間', '月次']) or ('月' in text and 'month' not in t and '月〜' not in text):
         set_target(chat_id, 'monthly', amount)
         sent = await update.message.reply_text(f"✅ 月間目標を ₱{amount:,.0f} に設定しました。")
     elif '週' in text or 'week' in t:
@@ -1765,11 +1787,19 @@ async def cmd_set_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: s
 
 async def cmd_view_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    daily   = get_target(chat_id, 'daily')
-    weekly  = get_target(chat_id, 'weekly')
-    monthly = get_target(chat_id, 'monthly')
-    lines   = ["🎯 現在の売上目標"]
-    lines.append(f"日次目標: {f'₱{daily:,.0f}'   if daily   > 0 else '未設定'}")
+    daily       = get_target(chat_id, 'daily')
+    mon_thu     = get_target(chat_id, 'daily_mon_thu')
+    fri         = get_target(chat_id, 'daily_fri')
+    sat_sun     = get_target(chat_id, 'daily_sat_sun')
+    weekly      = get_target(chat_id, 'weekly')
+    monthly     = get_target(chat_id, 'monthly')
+    lines = ["🎯 現在の売上目標"]
+    if mon_thu > 0 or fri > 0 or sat_sun > 0:
+        lines.append(f"日次目標（月〜木）: {f'₱{mon_thu:,.0f}' if mon_thu > 0 else '未設定'}")
+        lines.append(f"日次目標（金）:     {f'₱{fri:,.0f}'     if fri     > 0 else '未設定'}")
+        lines.append(f"日次目標（土・日）: {f'₱{sat_sun:,.0f}' if sat_sun > 0 else '未設定'}")
+    else:
+        lines.append(f"日次目標: {f'₱{daily:,.0f}' if daily > 0 else '未設定'}")
     lines.append(f"週次目標: {f'₱{weekly:,.0f}'  if weekly  > 0 else '未設定'}")
     lines.append(f"月間目標: {f'₱{monthly:,.0f}' if monthly > 0 else '未設定'}")
     sent = await update.message.reply_text("\n".join(lines))
