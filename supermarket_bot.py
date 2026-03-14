@@ -299,6 +299,18 @@ def delete_target(chat_id: int, target_type: str):
     conn.commit()
     conn.close()
 
+def get_target_any(chat_id: int, target_type: str) -> float:
+    """Like get_target but searches all linked chat IDs (STORE_GROUP_IDS)."""
+    ids = get_chat_ids(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    placeholders = ','.join('?' * len(ids))
+    c.execute(f'SELECT amount FROM sales_targets WHERE chat_id IN ({placeholders}) AND target_type=? LIMIT 1',
+              (*ids, target_type))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0.0
+
 def get_daily_target(chat_id: int, date_str: str) -> float:
     """Return the day-of-week-specific daily target, falling back to generic 'daily'."""
     try:
@@ -308,8 +320,8 @@ def get_daily_target(chat_id: int, date_str: str) -> float:
     if wd <= 3:   target_type = 'daily_mon_thu'   # Mon-Thu
     elif wd == 4: target_type = 'daily_fri'        # Fri
     else:         target_type = 'daily_sat_sun'    # Sat-Sun
-    v = get_target(chat_id, target_type)
-    return v if v > 0 else get_target(chat_id, 'daily')
+    v = get_target_any(chat_id, target_type)
+    return v if v > 0 else get_target_any(chat_id, 'daily')
 
 def is_supermarket_report(text: str) -> bool:
     t = text.lower()
@@ -889,14 +901,23 @@ def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts:
         prev_line = f"\n📊 前日売上: ₱{data['previous_sales']:,.0f}"
 
     monthly_line = ""
-    if data['monthly_total'] > 0:
+    _monthly_cum = data['monthly_total']
+    if _monthly_cum <= 0 and monthly_target > 0:
+        # Fallback: sum from DB for current month
+        try:
+            _y, _m = int(data['date'][:4]), int(data['date'][5:7])
+            _recs, _, _ = get_month_records(data.get('_chat_id', 0) or 0, _y, _m)
+            _monthly_cum = sum(r['total'] for r in _recs)
+        except Exception:
+            pass
+    if _monthly_cum > 0:
         if monthly_target > 0:
-            m_ach    = data['monthly_total'] / monthly_target * 100
+            m_ach    = _monthly_cum / monthly_target * 100
             m_filled = min(int(m_ach // 10), 10)
             m_bar    = "🟩" * m_filled + "⬜" * (10 - m_filled)
-            monthly_line = f"\n⭐️ 月間累計: ₱{data['monthly_total']:,.0f}  🎯{m_ach:.1f}% {m_bar}"
+            monthly_line = f"\n⭐️ 月間累計: ₱{_monthly_cum:,.0f}  🎯{m_ach:.1f}% {m_bar}"
         else:
-            monthly_line = f"\n⭐️ 月間累計: ₱{data['monthly_total']:,.0f}"
+            monthly_line = f"\n⭐️ 月間累計: ₱{_monthly_cum:,.0f}"
 
     target_line = ""
     if daily_target > 0:
@@ -1818,7 +1839,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             alerts       = check_alerts(data, prev)
             comments     = generate_ai_comment(data, prev)
             daily_target   = get_daily_target(chat_id, data.get('date', ''))
-            monthly_target = get_target(chat_id, 'monthly')
+            monthly_target = get_target_any(chat_id, 'monthly')
+            data['_chat_id'] = chat_id
             reply          = format_daily_report(data, prev, comments, alerts, daily_target, monthly_target)
             sent = await update.message.reply_text(reply)
             save_bot_message(chat_id, sent.message_id)
