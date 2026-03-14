@@ -203,12 +203,15 @@ def parse_manpower_schedule(text: str) -> dict:
         result['date'] = datetime.now().strftime('%Y-%m-%d')
     # Manager/OIC per shift
     for shift_key, patterns in [
-        ('graveyard', [r'graveyard.*?(?:OIC|Team Lead|Manager)\s*[:/]?\s*([A-Za-z ]+)']),
-        ('morning',   [r'morning.*?Manager\s*[:/]?\s*([A-Za-z ]+)']),
-        ('afternoon', [r'afternoon.*?Manager\s*[:/]?\s*([A-Za-z ]+)']),
+        ('graveyard', [
+            r'graveyard[^\n]*\n[^\n]*(?:OIC|Team Lead|Manager)[^:\n]*:\s*([A-Za-z ]+)',
+            r'(?:OIC|Team Lead)[^:\n]*:\s*([A-Za-z ]+)',
+        ]),
+        ('morning',   [r'morning[^\n]*\n[^\n]*Manager[^:\n]*:\s*([A-Za-z ]+)']),
+        ('afternoon', [r'afternoon[^\n]*\n[^\n]*Manager[^:\n]*:\s*([A-Za-z ]+)']),
     ]:
         for pat in patterns:
-            m = re.search(pat, text, re.IGNORECASE | re.DOTALL)
+            m = re.search(pat, text, re.IGNORECASE)
             if m:
                 name = m.group(1).strip().split('\n')[0].strip()
                 result[shift_key] = name
@@ -862,7 +865,7 @@ CAT_LABELS = [
 ]
 
 # ─── Format daily report ───────────────────────────────────
-def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts: list, daily_target: float = 0.0, monthly_target: float = 0.0) -> str:
+def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts: list, daily_target: float = 0.0, monthly_target: float = 0.0, chat_id: int = 0) -> str:
     total = data['total'] if data['total'] > 0 else 1
     shift_total = data['morning'] + data['afternoon'] + data['graveyard']
     avg_tx = total / data['transaction_count'] if data['transaction_count'] > 0 else 0
@@ -906,7 +909,7 @@ def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts:
         # Fallback: sum from DB for current month
         try:
             _y, _m = int(data['date'][:4]), int(data['date'][5:7])
-            _recs, _, _ = get_month_records(data.get('_chat_id', 0) or 0, _y, _m)
+            _recs, _, _ = get_month_records(chat_id, _y, _m)
             _monthly_cum = sum(r['total'] for r in _recs)
         except Exception:
             pass
@@ -1277,7 +1280,7 @@ async def _send_weekly_report(bot, chat_id: int, records: list, label: str = "�
 {cat_weekly_rows}"""
 
     # ── Weekly target comparison ──
-    weekly_target = get_target(chat_id, 'weekly')
+    weekly_target = get_target_any(chat_id, 'weekly')
     if weekly_target > 0:
         w_ach = total_sum / weekly_target * 100
         w_filled = min(int(w_ach // 10), 10)
@@ -1464,7 +1467,7 @@ async def cmd_monthly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     days_in_month  = calendar.monthrange(today.year, today.month)[1]
     days_remaining = days_in_month - days_elapsed
     projected      = (total_sum / days_elapsed * days_in_month) if days_elapsed > 0 else 0
-    monthly_target = get_target(chat_id, 'monthly')
+    monthly_target = get_target_any(chat_id, 'monthly')
     if monthly_target > 0:
         m_ach    = total_sum / monthly_target * 100
         m_filled = min(int(m_ach // 10), 10)
@@ -1841,7 +1844,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             daily_target   = get_daily_target(chat_id, data.get('date', ''))
             monthly_target = get_target_any(chat_id, 'monthly')
             data['_chat_id'] = chat_id
-            reply          = format_daily_report(data, prev, comments, alerts, daily_target, monthly_target)
+            reply          = format_daily_report(data, prev, comments, alerts, daily_target, monthly_target, chat_id)
             sent = await update.message.reply_text(reply)
             save_bot_message(chat_id, sent.message_id)
         except Exception as e:
@@ -1997,7 +2000,8 @@ async def missing_report_reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"missing_report_reminder group message error: {e}")
     # DM only the afternoon shift manager for yesterday
-    manager_name = get_last_shift_manager(yesterday, WEEKLY_REPORT_CHAT_ID)
+    _shift_chat = STORE_GROUP_IDS[0] if STORE_GROUP_IDS else WEEKLY_REPORT_CHAT_ID
+    manager_name = get_last_shift_manager(yesterday, _shift_chat)
     if manager_name:
         tid = find_manager_id(manager_name)
         if tid:
@@ -2035,7 +2039,7 @@ async def auto_monthly_report_job(ctx: ContextTypes.DEFAULT_TYPE):
         total_sum     = sum(r['total'] for r in records)
         n             = len(records)
         days_in_month = calendar.monthrange(prev_year, prev_month)[1]
-        monthly_target = get_target(WEEKLY_REPORT_CHAT_ID, 'monthly')
+        monthly_target = get_target_any(WEEKLY_REPORT_CHAT_ID, 'monthly')
         target_line = ""
         if monthly_target > 0:
             ach     = total_sum / monthly_target * 100
