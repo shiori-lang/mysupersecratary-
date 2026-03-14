@@ -1720,6 +1720,8 @@ def detect_intent(text: str) -> Optional[str]:
         return 'reset_target'
     if '目標確認' in t or '目標を見' in t or ('目標' in t and ('確認' in t or '見せ' in t or 'show' in t or '教えて' in t)):
         return 'view_target'
+    if re.search(r'\d{1,2}[/月]\d{1,2}', t) and any(k in t for k in ['確認', 'データ', 'check', '記録', '見せ', '見て']):
+        return 'check_date'
     return None
 
 def is_bot_mentioned(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1883,6 +1885,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == 'set_target':     await cmd_set_target(update, ctx, text)
     elif intent == 'reset_target':   await cmd_reset_target(update, ctx, text)
     elif intent == 'view_target':    await cmd_view_target(update, ctx)
+    elif intent == 'check_date':     await cmd_check_date(update, ctx, text)
     else:
         try:
             reply_text = ai_chat(text)
@@ -2161,6 +2164,36 @@ async def cmd_reset_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text:
     else:
         delete_target(chat_id, 'daily')
         sent = await update.message.reply_text("🗑️ 日次目標を削除しました。")
+    save_bot_message(chat_id, sent.message_id)
+
+async def cmd_check_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    """Show stored record for a specific date. Usage: '3/13のデータを確認'"""
+    chat_id = update.effective_chat.id
+    # Extract date from message
+    m = re.search(r'(\d{1,2})[/月](\d{1,2})', text)
+    if not m:
+        sent = await update.message.reply_text("📅 日付を指定してください。例：「3/13のデータ確認」")
+        save_bot_message(chat_id, sent.message_id)
+        return
+    month, day = int(m.group(1)), int(m.group(2))
+    year = datetime.now().year
+    date_str = f'{year:04d}-{month:02d}-{day:02d}'
+    conn = get_conn()
+    c = conn.cursor()
+    ids = STORE_GROUP_IDS if STORE_GROUP_IDS else [chat_id]
+    placeholders = ','.join('?' * len(ids))
+    c.execute(f'SELECT date, store, submitted_by, total, chat_id FROM supermarket_sales '
+              f'WHERE chat_id IN ({placeholders}) AND date=? ORDER BY created_at DESC',
+              (*ids, date_str))
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        sent = await update.message.reply_text(f"📭 {date_str} のデータはDBに存在しません。\nレポートが正常に保存されていない可能性があります。")
+    else:
+        lines = [f"✅ {date_str} のDBデータ:"]
+        for r in rows:
+            lines.append(f"  店舗: {r[1]} | 提出者: {r[2]} | 合計: ₱{r[3]:,.0f} | chat_id: {r[4]}")
+        sent = await update.message.reply_text("\n".join(lines))
     save_bot_message(chat_id, sent.message_id)
 
 # ─── Main ──────────────────────────────────────────────────
