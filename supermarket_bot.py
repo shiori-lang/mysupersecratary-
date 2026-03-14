@@ -1836,20 +1836,44 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 # 数字もなければ空テンプレート→無視
                 return
             await update.message.reply_text(f"🔍 レポートを受信しました（日付: {data['date']}）。分析中...")
-            prev         = get_previous(data['date'], data['store'], chat_id)
+            prev = get_previous(data['date'], data['store'], chat_id)
             save_record(data, text, chat_id)
-            await check_sales_anomaly(ctx.bot, chat_id, data.get('date', ''), data.get('total', 0))
-            alerts       = check_alerts(data, prev)
-            comments     = generate_ai_comment(data, prev)
-            daily_target   = get_daily_target(chat_id, data.get('date', ''))
-            monthly_target = get_target_any(chat_id, 'monthly')
-            data['_chat_id'] = chat_id
-            reply          = format_daily_report(data, prev, comments, alerts, daily_target, monthly_target, chat_id)
+            try:
+                await check_sales_anomaly(ctx.bot, chat_id, data.get('date', ''), data.get('total', 0))
+            except Exception as e:
+                logger.error(f"check_sales_anomaly error: {e}", exc_info=True)
+            try:
+                alerts = check_alerts(data, prev)
+            except Exception as e:
+                logger.error(f"check_alerts error: {e}", exc_info=True)
+                alerts = []
+            try:
+                comments = generate_ai_comment(data, prev)
+            except Exception as e:
+                logger.error(f"generate_ai_comment error: {e}", exc_info=True)
+                comments = "（AI分析スキップ）"
+            try:
+                daily_target   = get_daily_target(chat_id, data.get('date', ''))
+                monthly_target = get_target_any(chat_id, 'monthly')
+                reply = format_daily_report(data, prev, comments, alerts, daily_target, monthly_target, chat_id)
+            except Exception as e:
+                logger.error(f"format_daily_report error: {e}", exc_info=True)
+                reply = (
+                    f"📊 {data.get('date','?')} 売上レポート\n"
+                    f"売上合計: ₱{data.get('total', 0):,.0f}\n"
+                    f"（詳細フォーマットエラー: {e}）"
+                )
+            # Trim if over Telegram's 4096 char limit
+            if len(reply) > 4096:
+                reply = reply[:4090] + "\n…"
             sent = await update.message.reply_text(reply)
             save_bot_message(chat_id, sent.message_id)
         except Exception as e:
             logger.error(f"Report error: {e}", exc_info=True)
-            await update.message.reply_text(f"⚠️ 分析中にエラーが発生しました: {str(e)}")
+            try:
+                await update.message.reply_text(f"⚠️ 分析中にエラーが発生しました: {str(e)}")
+            except Exception:
+                pass
         return
 
     # 2) Translation mode
@@ -1969,55 +1993,6 @@ async def check_sales_anomaly(bot, chat_id: int, date_str: str, total: float):
         logger.error(f"check_sales_anomaly error: {e}")
 
 # ─── Scheduled jobs ────────────────────────────────────────
-async def missing_report_reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
-    """Runs daily at 00:15 PHT — alerts if no report submitted for yesterday."""
-    if not WEEKLY_REPORT_CHAT_ID:
-        return
-    # At 00:15 the calendar has just rolled over, so check yesterday
-    yesterday = (datetime.now(PHT) - timedelta(days=1)).strftime('%Y-%m-%d')
-    conn  = get_conn()
-    c     = conn.cursor()
-    # Use all registered group IDs so reports submitted in any linked group are found
-    ids   = STORE_GROUP_IDS if STORE_GROUP_IDS else [WEEKLY_REPORT_CHAT_ID]
-    placeholders = ','.join('?' * len(ids))
-    c.execute(
-        f'SELECT COUNT(*) FROM supermarket_sales WHERE chat_id IN ({placeholders}) AND date=?',
-        (*ids, yesterday)
-    )
-    count = c.fetchone()[0]
-    conn.close()
-    if count > 0:
-        logger.info(f"missing_report_reminder: report exists for {yesterday}, skipping")
-        return
-    logger.info(f"missing_report_reminder: no report for {yesterday}, sending alerts")
-    group_msg = (
-        f"⚠️ レポート未提出リマインダー\n"
-        f"昨日（{yesterday}）の売上レポートがまだ提出されていません。\n"
-        f"担当マネージャーは早急に提出をお願いします。"
-    )
-    try:
-        await ctx.bot.send_message(chat_id=WEEKLY_REPORT_CHAT_ID, text=group_msg)
-    except Exception as e:
-        logger.error(f"missing_report_reminder group message error: {e}")
-    # DM only the afternoon shift manager for yesterday
-    _shift_chat = STORE_GROUP_IDS[0] if STORE_GROUP_IDS else WEEKLY_REPORT_CHAT_ID
-    manager_name = get_last_shift_manager(yesterday, _shift_chat)
-    if manager_name:
-        tid = find_manager_id(manager_name)
-        if tid:
-            try:
-                await ctx.bot.send_message(
-                    chat_id=tid,
-                    text=f"⚠️ {manager_name}, yesterday's ({yesterday}) sales report has not been submitted. "
-                         f"Please submit it as soon as possible!"
-                )
-                logger.info(f"missing_report_reminder: DM sent to {manager_name} ({tid})")
-            except Exception as e:
-                logger.error(f"missing_report_reminder DM to {manager_name} failed: {e}")
-        else:
-            logger.warning(f"missing_report_reminder: no Telegram ID found for manager '{manager_name}'")
-    else:
-        logger.warning(f"missing_report_reminder: no afternoon shift manager recorded for {yesterday}")
 
 async def auto_monthly_report_job(ctx: ContextTypes.DEFAULT_TYPE):
     """Runs daily at 8:00 AM PHT — on 1st of month, sends previous month's report to group."""
@@ -2243,12 +2218,6 @@ def main():
             name='auto_weekly_report',
         )
         logger.info(f"Weekly auto-report scheduled: Monday 08:00 PHT → chat_id={WEEKLY_REPORT_CHAT_ID}")
-        app.job_queue.run_daily(
-            missing_report_reminder_job,
-            time=dtime(0, 15, tzinfo=PHT),
-            name='missing_report_reminder',
-        )
-        logger.info(f"Missing report reminder scheduled: daily 00:15 PHT → chat_id={WEEKLY_REPORT_CHAT_ID}")
         # Monthly auto-report + staff performance (fire daily at 8am, jobs check if day==1)
         app.job_queue.run_daily(
             auto_monthly_report_job,
