@@ -1949,7 +1949,8 @@ async def missing_report_reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
     yesterday = (datetime.now(PHT) - timedelta(days=1)).strftime('%Y-%m-%d')
     conn  = get_conn()
     c     = conn.cursor()
-    ids   = get_chat_ids(WEEKLY_REPORT_CHAT_ID)
+    # Use all registered group IDs so reports submitted in any linked group are found
+    ids   = STORE_GROUP_IDS if STORE_GROUP_IDS else [WEEKLY_REPORT_CHAT_ID]
     placeholders = ','.join('?' * len(ids))
     c.execute(
         f'SELECT COUNT(*) FROM supermarket_sales WHERE chat_id IN ({placeholders}) AND date=?',
