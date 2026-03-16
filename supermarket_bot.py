@@ -1848,7 +1848,13 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"check_alerts error: {e}", exc_info=True)
                 alerts = []
             try:
-                comments = generate_ai_comment(data, prev)
+                comments = await asyncio.wait_for(
+                    asyncio.to_thread(generate_ai_comment, data, prev),
+                    timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("generate_ai_comment timed out after 30s")
+                comments = "（AI分析タイムアウト）"
             except Exception as e:
                 logger.error(f"generate_ai_comment error: {e}", exc_info=True)
                 comments = "（AI分析スキップ）"
