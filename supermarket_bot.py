@@ -1450,8 +1450,9 @@ Gross Profit: ₱{gross_profit:,.0f} ({pct(gross_profit,total_sum):.1f}%)"""
 
 async def cmd_weekly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    records = get_records(chat_id, days=7)
-    await _send_weekly_report(ctx.bot, chat_id, records, label="今週（直近7日）")
+    lookup_chat = STORE_GROUP_IDS[0] if STORE_GROUP_IDS else chat_id
+    records, start, end = get_last_week_records(lookup_chat)
+    await _send_weekly_report(ctx.bot, chat_id, records, label=f"先週（{start} 〜 {end}）")
 
 
 async def cmd_monthly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
