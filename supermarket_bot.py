@@ -1839,8 +1839,16 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 # 数字もなければ空テンプレート→無視
                 return
             await update.message.reply_text(f"🔍 レポートを受信しました（日付: {data['date']}）。分析中...")
-            prev = get_previous(data['date'], data['store'], chat_id)
-            save_record(data, text, chat_id)
+            # Save FIRST — before any DB reads or blocking calls that could fail
+            try:
+                save_record(data, text, chat_id)
+            except Exception as e:
+                logger.error(f"save_record error: {e}", exc_info=True)
+            try:
+                prev = get_previous(data['date'], data['store'], chat_id)
+            except Exception as e:
+                logger.error(f"get_previous error: {e}", exc_info=True)
+                prev = None
             try:
                 await check_sales_anomaly(ctx.bot, chat_id, data.get('date', ''), data.get('total', 0))
             except Exception as e:
