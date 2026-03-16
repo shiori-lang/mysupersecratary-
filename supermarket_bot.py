@@ -328,17 +328,20 @@ def get_daily_target(chat_id: int, date_str: str) -> float:
 
 def is_supermarket_report(text: str) -> bool:
     t = text.lower()
-    checks = [
-        'cash sale' in t,
-        'for deposit' in t,
-        'maya' in t,
-        'card sale' in t or 'credit' in t,
-        'previous sales' in t,
-        'morning' in t,
-        'transaction' in t,
-        'date today' in t,
-    ]
-    return sum(checks) >= 4
+    check_map = {
+        'cash sale':      'cash sale' in t,
+        'for deposit':    'for deposit' in t,
+        'maya':           'maya' in t,
+        'card/credit':    'card sale' in t or 'credit' in t,
+        'previous sales': 'previous sales' in t,
+        'morning':        'morning' in t,
+        'transaction':    'transaction' in t,
+        'date today':     'date today' in t,
+    }
+    matched = sum(check_map.values())
+    if matched < 4:
+        logger.info(f"is_supermarket_report: {matched}/8 matched — {[k for k,v in check_map.items() if not v]} missing")
+    return matched >= 4
 
 def parse_report(text: str) -> dict:
     d = {}
@@ -1787,6 +1790,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     text    = update.message.text
     chat_id = update.effective_chat.id
+    user    = update.effective_user
+    logger.info(f"MSG received | chat={chat_id} | user={user.username or user.id} | len={len(text)} | preview={text[:60].replace(chr(10),' ')!r}")
 
     # 0) シフトスケジュールの自動検知
     if is_manpower_schedule(text):
@@ -1804,7 +1809,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # 1) 売上レポートの自動検知
-    if is_supermarket_report(text):
+    _is_report = is_supermarket_report(text)
+    logger.info(f"is_supermarket_report={_is_report} | chat={chat_id}")
+    if _is_report:
         try:
             data     = parse_report(text)
             # Validate parsed date
