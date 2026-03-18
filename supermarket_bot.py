@@ -204,11 +204,15 @@ def parse_manpower_schedule(text: str) -> dict:
     # Manager/OIC per shift
     for shift_key, patterns in [
         ('graveyard', [
-            r'graveyard[^\n]*\n[^\n]*(?:OIC|Team Lead|Manager)[^:\n]*:\s*([A-Za-z ]+)',
+            r'graveyard[\s\S]{0,300}?(?:OIC|Team Lead|Manager)[^:\n]*:\s*([A-Za-z ]+)',
             r'(?:OIC|Team Lead)[^:\n]*:\s*([A-Za-z ]+)',
         ]),
-        ('morning',   [r'morning[^\n]*\n[^\n]*Manager[^:\n]*:\s*([A-Za-z ]+)']),
-        ('afternoon', [r'afternoon[^\n]*\n[^\n]*Manager[^:\n]*:\s*([A-Za-z ]+)']),
+        ('morning', [
+            r'morning[\s\S]{0,300}?(?:OIC|Team Lead|Manager)[^:\n]*:\s*([A-Za-z ]+)',
+        ]),
+        ('afternoon', [
+            r'afternoon[\s\S]{0,300}?(?:OIC|Team Lead|Manager)[^:\n]*:\s*([A-Za-z ]+)',
+        ]),
     ]:
         for pat in patterns:
             m = re.search(pat, text, re.IGNORECASE)
