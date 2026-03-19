@@ -2286,8 +2286,8 @@ def main():
         app.run_webhook(
             listen='0.0.0.0',
             port=_port,
-            url_path=BOT_TOKEN,
-            webhook_url=f'{_webhook_url}/{BOT_TOKEN}',
+            url_path='webhook',
+            webhook_url=f'{_webhook_url}/webhook',
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=False,
         )
