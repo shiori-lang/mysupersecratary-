@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from telegram import Update
 from telegram.ext import (
-    Application, MessageHandler,
+    Application, MessageHandler, TypeHandler,
     filters, ContextTypes
 )
 
@@ -2238,6 +2238,16 @@ def main():
         raise ValueError("ANTHROPIC_API_KEY is not set")
 
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # Diagnostic: log ALL incoming updates before any handler processes them
+    async def _log_raw_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id if update.effective_chat else 'N/A'
+        msg = update.effective_message
+        msg_type = type(msg).__name__ if msg else 'None'
+        text_preview = (msg.text or msg.caption or '')[:40] if msg else ''
+        logger.info(f"RAW UPDATE | chat={chat_id} | msg_type={msg_type} | preview={text_preview!r}")
+    app.add_handler(TypeHandler(Update, _log_raw_update), group=-1)
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Schedule auto weekly report every Monday 8:00 AM PHT (UTC+8 = UTC 0:00)
