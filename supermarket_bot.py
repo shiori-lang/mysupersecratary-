@@ -2280,42 +2280,7 @@ def main():
     _webhook_url    = os.environ.get('WEBHOOK_URL', f'https://{_railway_domain}' if _railway_domain else '')
     _port           = int(os.environ.get('PORT', 8080))
 
-    if _webhook_url:
-        import uvicorn
-        from fastapi import FastAPI, Request, Response
-        from contextlib import asynccontextmanager
-
-        @asynccontextmanager
-        async def lifespan(web: FastAPI):
-            await app.initialize()
-            await app.start()
-            await app.bot.set_webhook(
-                url=f'{_webhook_url}/webhook',
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=False,
-            )
-            logger.info(f"Webhook set: {_webhook_url}/webhook on port {_port}")
-            yield
-            await app.stop()
-            await app.shutdown()
-
-        web_app = FastAPI(lifespan=lifespan)
-
-        @web_app.post('/webhook')
-        async def webhook_handler(request: Request):
-            data = await request.json()
-            update = Update.de_json(data, app.bot)
-            await app.process_update(update)
-            return Response(status_code=200)
-
-        @web_app.get('/health')
-        async def health():
-            return {'status': 'ok'}
-
-        uvicorn.run(web_app, host='0.0.0.0', port=_port)
-    else:
-        logger.info("WEBHOOK_URL not set — using polling")
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
