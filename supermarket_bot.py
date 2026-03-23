@@ -1705,6 +1705,45 @@ async def cmd_strategy(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str
         logger.error(f"Strategy AI error: {e}")
         await update.message.reply_text("⚠️ 分析中にエラーが発生しました。しばらくしてからもう一度お試しください。")
 
+async def cmd_fix_duplicates(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """オーナー専用: 同じ日付の重複レコードを削除（最新を残す）"""
+    user_id = update.effective_user.id if update.effective_user else 0
+    if OWNER_CHAT_ID and user_id != OWNER_CHAT_ID:
+        await update.message.reply_text("このコマンドはオーナーのみ使用できます。")
+        return
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''
+        SELECT date, chat_id, COUNT(*) as cnt
+        FROM supermarket_sales
+        GROUP BY date, chat_id
+        HAVING cnt > 1
+        ORDER BY date DESC
+    ''')
+    dupes = c.fetchall()
+    if not dupes:
+        await update.message.reply_text("✅ 重複なし。DBはきれいです。")
+        conn.close()
+        return
+    total_deleted = 0
+    lines = ["🗑️ 重複レコードを削除しました:\n"]
+    for date, chat_id_val, cnt in dupes:
+        c.execute('''
+            SELECT id, store FROM supermarket_sales
+            WHERE date=? AND chat_id=?
+            ORDER BY id DESC
+        ''', (date, chat_id_val))
+        rows = c.fetchall()
+        delete_ids = [r[0] for r in rows[1:]]
+        placeholders = ','.join('?' * len(delete_ids))
+        c.execute(f'DELETE FROM supermarket_sales WHERE id IN ({placeholders})', delete_ids)
+        total_deleted += len(delete_ids)
+        lines.append(f"  {date}: {cnt}件 → 1件に整理")
+    conn.commit()
+    conn.close()
+    lines.append(f"\n合計 {total_deleted} 件削除しました。")
+    await update.message.reply_text("\n".join(lines))
+
 async def cmd_last_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     records, start, end = get_last_week_records(chat_id)
@@ -1756,6 +1795,8 @@ def detect_intent(text: str) -> Optional[str]:
             '翻訳' in t and any(k in t for k in ['終了', 'ストップ', 'stop', 'やめ', 'オフ', 'off'])):
         return 'translate_off'
 
+    if any(k in t for k in ['重複修正', '重複削除', 'fix_duplicates', 'fix duplicates']):
+        return 'fix_duplicates'
     if any(k in t for k in ['削除', 'delete', '消して', '取り消し']):
         if any(k in t for k in ['メッセージ', 'ボット', 'bot', '発言', '全部', '件']):
             return 'delete_bot'
@@ -1961,6 +2002,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == 'compare_payment':  await cmd_compare(update, ctx, 'payment')
     elif intent == 'trend':            await cmd_trend(update, ctx)
     elif intent == 'export':           await cmd_export(update, ctx)
+    elif intent == 'fix_duplicates':   await cmd_fix_duplicates(update, ctx)
     elif intent == 'delete':           await cmd_delete(update, ctx, text)
     elif intent == 'delete_bot':       await cmd_delete_bot_messages(update, ctx, text)
     elif intent == 'translate_on':
