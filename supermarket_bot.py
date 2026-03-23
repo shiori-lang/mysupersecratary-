@@ -1716,20 +1716,26 @@ async def cmd_strategy(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str
         await update.message.reply_text("⚠️ 分析中にエラーが発生しました。しばらくしてからもう一度お試しください。")
 
 async def cmd_fix_duplicates(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """オーナー専用: 同じ日付の重複レコードを削除（最新を残す）"""
+    """オーナー専用: 同じ日付の重複レコードを削除（最新を残す）
+    同一chat_id内の重複 + リンクグループ間の同日付重複 の両方を処理する"""
     user_id = update.effective_user.id if update.effective_user else 0
     if OWNER_CHAT_ID and user_id != OWNER_CHAT_ID:
         await update.message.reply_text("このコマンドはオーナーのみ使用できます。")
         return
+    chat_id = update.effective_chat.id
+    ids = get_chat_ids(chat_id)
+    placeholders = ','.join('?' * len(ids))
     conn = get_conn()
     c = conn.cursor()
-    c.execute('''
-        SELECT date, chat_id, COUNT(*) as cnt
+    # 同じ日付で複数レコード（異なるchat_idも含む）を検索
+    c.execute(f'''
+        SELECT date, COUNT(*) as cnt
         FROM supermarket_sales
-        GROUP BY date, chat_id
+        WHERE chat_id IN ({placeholders})
+        GROUP BY date
         HAVING cnt > 1
         ORDER BY date DESC
-    ''')
+    ''', ids)
     dupes = c.fetchall()
     if not dupes:
         await update.message.reply_text("✅ 重複なし。DBはきれいです。")
@@ -1737,16 +1743,17 @@ async def cmd_fix_duplicates(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     total_deleted = 0
     lines = ["🗑️ 重複レコードを削除しました:\n"]
-    for date, chat_id_val, cnt in dupes:
-        c.execute('''
-            SELECT id, store FROM supermarket_sales
-            WHERE date=? AND chat_id=?
+    for date, cnt in dupes:
+        # 同じ日付の全レコードを取得し、最新(id最大)だけ残す
+        c.execute(f'''
+            SELECT id FROM supermarket_sales
+            WHERE date=? AND chat_id IN ({placeholders})
             ORDER BY id DESC
-        ''', (date, chat_id_val))
+        ''', (date, *ids))
         rows = c.fetchall()
         delete_ids = [r[0] for r in rows[1:]]
-        placeholders = ','.join('?' * len(delete_ids))
-        c.execute(f'DELETE FROM supermarket_sales WHERE id IN ({placeholders})', delete_ids)
+        placeholders2 = ','.join('?' * len(delete_ids))
+        c.execute(f'DELETE FROM supermarket_sales WHERE id IN ({placeholders2})', delete_ids)
         total_deleted += len(delete_ids)
         lines.append(f"  {date}: {cnt}件 → 1件に整理")
     conn.commit()
