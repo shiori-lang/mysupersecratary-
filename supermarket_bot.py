@@ -15,6 +15,13 @@ import calendar
 from datetime import datetime, timedelta, time as dtime, timezone
 from typing import Optional
 
+# ローカル開発時に .env を自動読み込み（本番環境では無視）
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import anthropic
 import matplotlib
 matplotlib.use('Agg')
