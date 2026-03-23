@@ -636,8 +636,13 @@ def get_last_week_records(chat_id: int):
     c = conn.cursor()
     ids = get_chat_ids(chat_id)
     placeholders = ','.join('?' * len(ids))
+    # 同じ日付が複数グループに保存されている場合は最新(id最大)を1件だけ取得
     c.execute(f'''SELECT * FROM supermarket_sales
-                 WHERE chat_id IN ({placeholders}) AND date>=? AND date<=?
+                 WHERE id IN (
+                     SELECT MAX(id) FROM supermarket_sales
+                     WHERE chat_id IN ({placeholders}) AND date>=? AND date<=?
+                     GROUP BY date
+                 )
                  ORDER BY date ASC''', (*ids, start, end))
     rows = c.fetchall()
     col_names = [d[0] for d in c.description]
@@ -655,8 +660,13 @@ def get_month_records(chat_id: int, year: int = None, month: int = None):
     c = conn.cursor()
     ids = get_chat_ids(chat_id)
     placeholders = ','.join('?' * len(ids))
+    # 同じ日付が複数グループに保存されている場合は最新(id最大)を1件だけ取得
     c.execute(f'''SELECT * FROM supermarket_sales
-                 WHERE chat_id IN ({placeholders}) AND date>=? AND date<=?
+                 WHERE id IN (
+                     SELECT MAX(id) FROM supermarket_sales
+                     WHERE chat_id IN ({placeholders}) AND date>=? AND date<=?
+                     GROUP BY date
+                 )
                  ORDER BY date ASC''', (*ids, start, end))
     rows = c.fetchall()
     col_names = [d[0] for d in c.description]
