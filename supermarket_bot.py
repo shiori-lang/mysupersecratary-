@@ -732,10 +732,13 @@ def save_bot_message(chat_id: int, message_id: int):
     conn.commit()
     conn.close()
 
-def get_bot_messages(chat_id: int, limit: int = None) -> list:
+def get_bot_messages(chat_id: int, limit: int = None, hours: int = None) -> list:
     conn = get_conn()
     c = conn.cursor()
-    if limit:
+    if hours:
+        since = (datetime.now() - timedelta(hours=hours)).strftime('%Y-%m-%d %H:%M:%S')
+        c.execute('SELECT message_id FROM bot_messages WHERE chat_id=? AND created_at >= ? ORDER BY created_at DESC', (chat_id, since))
+    elif limit:
         c.execute('SELECT message_id FROM bot_messages WHERE chat_id=? ORDER BY created_at DESC LIMIT ?', (chat_id, limit))
     else:
         c.execute('SELECT message_id FROM bot_messages WHERE chat_id=? ORDER BY created_at DESC', (chat_id,))
@@ -766,23 +769,23 @@ def set_translate_mode(chat_id: int, enabled: bool):
     conn.commit()
     conn.close()
 
-def translate_text(text: str) -> str:
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+async def translate_text(text: str) -> str:
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
     prompt = (
         "Translate the following text. "
         "If Japanese, translate to English. If English, translate to Japanese. "
         "Return translation only, no explanation.\n\nText: " + text
     )
-    resp = client.messages.create(
+    resp = await client.messages.create(
         model="claude-opus-4-5",
         max_tokens=1000,
         messages=[{"role": "user", "content": prompt}]
     )
     return resp.content[0].text.strip()
 
-def ai_chat(text: str) -> str:
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-    resp = client.messages.create(
+async def ai_chat(text: str) -> str:
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
+    resp = await client.messages.create(
         model="claude-opus-4-5",
         max_tokens=1000,
         system="あなたは「みどりのマート」のマネジメントです。店舗運営・売上・スタッフ管理などについて、マネージャーの立場で実践的にアドバイスしてください。ユーザーが書いた言語と同じ言語で回答し、簡潔に答えてください。",
@@ -829,9 +832,9 @@ def check_alerts(data: dict, prev: Optional[dict]) -> list:
     return alerts
 
 # ─── Claude comment ────────────────────────────────────────
-def generate_ai_comment(data: dict, prev: Optional[dict]) -> str:
+async def generate_ai_comment(data: dict, prev: Optional[dict]) -> str:
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
         total = data['total'] if data['total'] > 0 else 1
         shift_total = data['morning'] + data['afternoon'] + data['graveyard']
         comp = ""
@@ -866,7 +869,7 @@ Morning: {data['morning']/shift_total*100 if shift_total>0 else 0:.1f}% | Aftern
 {comp}
 {cat_note}"""
 
-        resp = client.messages.create(
+        resp = await client.messages.create(
             model="claude-opus-4-5",
             max_tokens=400,
             messages=[{"role": "user", "content": prompt}]
@@ -1413,16 +1416,16 @@ Wastage Rate: {wast_pct:.1f}% | Discount Rate: {disc_pct:.1f}% | Cash Ratio: {ca
 Best Day: {best['date']} ₱{best['total']:,.0f} | Worst Day: {worst['date']} ₱{worst['total']:,.0f}
 Gross Profit: ₱{gross_profit:,.0f} ({pct(gross_profit,total_sum):.1f}%)"""
 
-        def _call_ai():
-            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-            r_jp = client.messages.create(model="claude-opus-4-5", max_tokens=500,
-                                          messages=[{"role": "user", "content": prompt}])
-            r_en = client.messages.create(model="claude-opus-4-5", max_tokens=500,
-                                          messages=[{"role": "user", "content": prompt_en}])
+        async def _call_ai():
+            _client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
+            r_jp = await _client.messages.create(model="claude-opus-4-5", max_tokens=500,
+                                                  messages=[{"role": "user", "content": prompt}])
+            r_en = await _client.messages.create(model="claude-opus-4-5", max_tokens=500,
+                                                  messages=[{"role": "user", "content": prompt_en}])
             return r_jp.content[0].text.strip(), r_en.content[0].text.strip()
 
         text_jp, text_en = await asyncio.wait_for(
-            asyncio.to_thread(_call_ai), timeout=60.0
+            _call_ai(), timeout=60.0
         )
         sent2 = await bot.send_message(chat_id=chat_id, text=f"【11. 来週のアクション項目】\n{text_jp}")
         save_bot_message(chat_id, sent2.message_id)
@@ -1647,10 +1650,14 @@ async def cmd_delete_bot_messages(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     # Determine how many to delete
     if '全部' in t or 'all' in t:
         message_ids = get_bot_messages(chat_id)
+    elif '24時間' in t or '今日' in t:
+        message_ids = get_bot_messages(chat_id, hours=24)
     else:
         m = re.search(r'(\d+)\s*件', text)
-        limit = int(m.group(1)) if m else 1
-        message_ids = get_bot_messages(chat_id, limit=limit)
+        if m:
+            message_ids = get_bot_messages(chat_id, limit=int(m.group(1)))
+        else:
+            message_ids = get_bot_messages(chat_id, hours=24)  # デフォルト：24時間以内
 
     if not message_ids:
         await update.message.reply_text("🤖 削除できるメッセージがありません。")
@@ -1674,7 +1681,7 @@ async def cmd_strategy(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str
     chat_id = update.effective_chat.id
     records = get_records(chat_id, days=14)
     if not records:
-        reply = ai_chat(text)
+        reply = await ai_chat(text)
         sent = await update.message.reply_text(reply)
         save_bot_message(chat_id, sent.message_id)
         return
@@ -1702,8 +1709,8 @@ async def cmd_strategy(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str
 {daily_lines}"""
 
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        resp = client.messages.create(
+        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
+        resp = await client.messages.create(
             model="claude-opus-4-5",
             max_tokens=1000,
             system="あなたは「みどりのマート」のマネジメントです。提供された実際の売上データを根拠に、具体的で実践的なアドバイスをしてください。ユーザーが書いた言語で回答してください。",
@@ -1983,11 +1990,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 alerts = []
             try:
                 comments = await asyncio.wait_for(
-                    asyncio.to_thread(generate_ai_comment, data, prev),
-                    timeout=30.0
+                    generate_ai_comment(data, prev),
+                    timeout=60.0
                 )
             except asyncio.TimeoutError:
-                logger.warning("generate_ai_comment timed out after 30s")
+                logger.warning("generate_ai_comment timed out after 60s")
                 comments = "（AI分析タイムアウト）"
             except Exception as e:
                 logger.error(f"generate_ai_comment error: {e}", exc_info=True)
@@ -2028,7 +2035,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass  # fall through to command processing
         else:
             try:
-                translated = translate_text(text)
+                translated = await translate_text(text)
                 sent = await update.message.reply_text(f"🌐 {translated}")
                 save_bot_message(chat_id, sent.message_id)
             except Exception as e:
@@ -2079,7 +2086,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == 'check_date':     await cmd_check_date(update, ctx, text)
     else:
         try:
-            reply_text = ai_chat(text)
+            reply_text = await ai_chat(text)
             sent = await update.message.reply_text(reply_text)
             save_bot_message(chat_id, sent.message_id)
         except Exception as e:
