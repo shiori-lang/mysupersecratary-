@@ -472,19 +472,26 @@ def parse_report(text: str) -> dict:
 def save_record(data: dict, raw_text: str, chat_id: int):
     conn = get_conn()
     c = conn.cursor()
+    # Normalize store name: if a record already exists for this (date, chat_id),
+    # reuse the stored store name so ON CONFLICT(date, store, chat_id) triggers correctly
+    c.execute('SELECT store FROM supermarket_sales WHERE date=? AND chat_id=?',
+              (data['date'], chat_id))
+    _existing_store = c.fetchone()
+    if _existing_store:
+        data['store'] = _existing_store[0]
     # Cross-chat deduplication for STORE_GROUP_IDS linked groups
-    # 同じ日付・店舗のレコードが他のリンクグループに存在する場合は削除して新しい方で上書き
+    # 同じ日付のレコードが他のリンクグループに存在する場合は削除して新しい方で上書き
     ids = get_chat_ids(chat_id)
     if len(ids) > 1:
         placeholders_dup = ','.join('?' * len(ids))
         c.execute(
-            f'SELECT chat_id FROM supermarket_sales WHERE date=? AND store=? AND chat_id IN ({placeholders_dup}) AND chat_id != ?',
-            (data['date'], data['store'], *ids, chat_id)
+            f'SELECT chat_id FROM supermarket_sales WHERE date=? AND chat_id IN ({placeholders_dup}) AND chat_id != ?',
+            (data['date'], *ids, chat_id)
         )
         dup = c.fetchone()
         if dup:
-            c.execute('DELETE FROM supermarket_sales WHERE date=? AND store=? AND chat_id=?',
-                      (data['date'], data['store'], dup[0]))
+            c.execute('DELETE FROM supermarket_sales WHERE date=? AND chat_id=?',
+                      (data['date'], dup[0]))
     # Detect overwrite: warn if a record for this date already exists
     c.execute('SELECT id FROM supermarket_sales WHERE date=? AND store=? AND chat_id=?',
               (data['date'], data['store'], chat_id))
@@ -613,7 +620,7 @@ def get_records(chat_id: int, store: str = None, days: int = 30) -> list:
     return [dict(zip(col_names, r)) for r in rows]
 
 def get_last_week_records(chat_id: int):
-    today = datetime.now()
+    today = datetime.now(PHT)
     last_monday = today - timedelta(days=today.weekday() + 7)
     last_sunday = last_monday + timedelta(days=6)
     start = last_monday.strftime('%Y-%m-%d')
@@ -1789,10 +1796,11 @@ HELP_TEXT = """🤖 話しかけてくれてありがとう！
 
 # ─── Main message handler ──────────────────────────────────
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+    if not update.message:
         return
-
-    text    = update.message.text
+    text = update.message.text or update.message.caption or ''
+    if not text:
+        return
     chat_id = update.effective_chat.id
     user    = update.effective_user
     logger.info(f"MSG received | chat={chat_id} | user={user.username or user.id} | len={len(text)} | preview={text[:60].replace(chr(10),' ')!r}")
