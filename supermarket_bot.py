@@ -120,12 +120,20 @@ def init_db():
             other_expense     REAL DEFAULT 0,
             cashbox           REAL DEFAULT 0,
             for_deposit       REAL DEFAULT 0,
+            comment           TEXT DEFAULT '',
             raw_text          TEXT,
             chat_id           INTEGER,
             created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(date, store, chat_id)
         )
     ''')
+    # 既存DBにcommentカラムがない場合は追加（マイグレーション）
+    try:
+        c.execute('ALTER TABLE supermarket_sales ADD COLUMN comment TEXT DEFAULT ""')
+        conn.commit()
+        logger.info("Migrated: added 'comment' column to supermarket_sales")
+    except Exception:
+        pass  # カラムが既に存在する場合は無視
     # Bot message log table
     c.execute('''
         CREATE TABLE IF NOT EXISTS bot_messages (
@@ -473,6 +481,10 @@ def parse_report(text: str) -> dict:
     d['cat_ice_cream']        = _cat_num(text, 'ICE CREAM')
     d['cat_bath_item']        = _cat_num(text, 'BATH ITEM')
 
+    # コメント欄（COMENT / COMMENT どちらも対応）
+    m_comment = re.search(r'CO[MN]{1,2}ENT\s*:?\s*(.+)', text, re.IGNORECASE)
+    d['comment'] = m_comment.group(1).strip() if m_comment else ''
+
     return d
 
 # ─── DB helpers ────────────────────────────────────────────
@@ -512,13 +524,13 @@ def save_record(data: dict, raw_text: str, chat_id: int):
             (date, store, submitted_by, cash_sale, card_sale, qr_ph, maya, grab,
              foodpanda, graveyard, morning, afternoon, discounts, wastage, total,
              monthly_total, cash_drawer, transaction_count, salary, inventory,
-             other_expense, cashbox, for_deposit,
+             other_expense, cashbox, for_deposit, comment,
              cat_instant_food, cat_seasoning, cat_grabmart, cat_frozen_item,
              cat_personal_care, cat_beverage, cat_snacks_candies, cat_chilled_item,
              cat_medicine, cat_bento, cat_rice_noodle_bread, cat_grabfood,
              cat_rte, cat_ice_cream, cat_bath_item,
              raw_text, chat_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(date, store, chat_id) DO UPDATE SET
                 submitted_by=excluded.submitted_by,
                 cash_sale=excluded.cash_sale,
@@ -541,6 +553,7 @@ def save_record(data: dict, raw_text: str, chat_id: int):
                 other_expense=excluded.other_expense,
                 cashbox=excluded.cashbox,
                 for_deposit=excluded.for_deposit,
+                comment=excluded.comment,
                 cat_instant_food=excluded.cat_instant_food,
                 cat_seasoning=excluded.cat_seasoning,
                 cat_grabmart=excluded.cat_grabmart,
@@ -566,6 +579,7 @@ def save_record(data: dict, raw_text: str, chat_id: int):
             data['total'], data['monthly_total'], data.get('cash_drawer', 0),
             data['transaction_count'], data['salary'], data['inventory'],
             data['other_expense'], data['cashbox'], data['for_deposit'],
+            data.get('comment', ''),
             data.get('cat_instant_food', 0), data.get('cat_seasoning', 0),
             data.get('cat_grabmart', 0), data.get('cat_frozen_item', 0),
             data.get('cat_personal_care', 0), data.get('cat_beverage', 0),
@@ -963,7 +977,7 @@ def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts:
         bar = "🟩" * filled + "⬜" * (10 - filled)
         target_line = f"\n🎯 日次目標達成率: {ach:.1f}% {bar}\n   ₱{data['total']:,.0f} / 目標 ₱{daily_target:,.0f}"
 
-    return f"""🏪 {data['store']} - 日次分析レポート{monthly_line}{prev_line}
+    report = f"""🏪 {data['store']} - 日次分析レポート{monthly_line}{prev_line}
 📅 {data['date']}（{data['submitted_by']}さん提出）
 ━━━━━━━━━━━━━━━━━━━━━━
 💰 売上総額: ₱{total:,.0f}
@@ -992,6 +1006,9 @@ def format_daily_report(data: dict, prev: Optional[dict], comments: str, alerts:
 {alert_block}{cat_block}
 💡 {data['submitted_by']}さんへのコメント
 {comments}{target_line}""".strip()
+    if data.get('comment'):
+        report += f"\n\n✏️ {data['comment']}"
+    return report
 
 # ─── Chart generators ──────────────────────────────────────
 def make_trend_chart(records: list, title: str = "Sales Trend") -> io.BytesIO:
