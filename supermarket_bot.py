@@ -2410,7 +2410,7 @@ def main():
         app.job_queue.run_daily(
             auto_weekly_report_job,
             time=dtime(8, 0, tzinfo=PHT),
-            days=(0,),  # 0 = Monday
+            days=(1,),  # PTB v20+: cron scheme where 1 = Monday
             name='auto_weekly_report',
         )
         logger.info(f"Weekly auto-report scheduled: Monday 08:00 PHT → chat_id={WEEKLY_REPORT_CHAT_ID}")
