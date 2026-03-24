@@ -1985,6 +1985,23 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     )
                 # 数字もなければ空テンプレート→無視
                 return
+            # 重複チェック：同じ日付のレコードが既に存在するか確認
+            _existing_raw = None
+            try:
+                _conn = get_conn()
+                _row = _conn.execute(
+                    'SELECT raw_text FROM supermarket_sales WHERE date=? AND chat_id=?',
+                    (data['date'], chat_id)
+                ).fetchone()
+                if _row:
+                    _existing_raw = _row[0]
+            except Exception:
+                pass
+            # 同じ内容（空白・改行を正規化して比較）→ スキップ
+            def _normalize(t): return re.sub(r'\s+', ' ', (t or '').strip().lower())
+            if _existing_raw and _normalize(_existing_raw) == _normalize(text):
+                logger.info(f"Duplicate report skipped (same content) | date={data['date']} | chat={chat_id}")
+                return  # 無言でスキップ
             await update.message.reply_text(f"🔍 レポートを受信しました（日付: {data['date']}）。分析中...")
             # Save FIRST — before any DB reads or blocking calls that could fail
             try:
