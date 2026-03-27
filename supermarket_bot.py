@@ -7,6 +7,7 @@ import os
 import re
 import io
 import csv
+import json
 import sqlite3
 import asyncio
 import logging
@@ -22,14 +23,15 @@ try:
 except ImportError:
     pass
 
+import httpx
 import anthropic
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, MessageHandler, TypeHandler,
+    Application, MessageHandler, TypeHandler, CallbackQueryHandler,
     filters, ContextTypes
 )
 
@@ -79,6 +81,9 @@ except ValueError:
 
 # Philippines Time (UTC+8) — used for scheduling
 PHT = timezone(timedelta(hours=8))
+
+# Brave Search API for procurement recommendations
+BRAVE_SEARCH_API_KEY = os.environ.get('BRAVE_SEARCH_API_KEY', '')
 
 # DB directory auto-create
 pathlib.Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -191,6 +196,15 @@ def init_db():
             c.execute(f'ALTER TABLE supermarket_sales ADD COLUMN {col} {definition}')
         except Exception:
             pass  # column already exists
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS procurement_settings (
+            chat_id        INTEGER PRIMARY KEY,
+            weekly_budget  REAL DEFAULT 0,
+            restock_day    INTEGER DEFAULT 1,
+            auto_send      INTEGER DEFAULT 1,
+            last_sent_date TEXT DEFAULT ''
+        )
+    ''')
     conn.commit()
     conn.close()
     logger.info("Database initialized.")
@@ -344,6 +358,61 @@ def get_daily_target(chat_id: int, date_str: str) -> float:
     else:         target_type = 'daily_sat_sun'    # Sat-Sun
     v = get_target_any(chat_id, target_type)
     return v if v > 0 else get_target_any(chat_id, 'daily')
+
+# ─── Procurement settings helpers ─────────────────────────
+WEEKDAY_NAMES_JA = ['月曜', '火曜', '水曜', '木曜', '金曜', '土曜', '日曜']
+WEEKDAY_NAMES_EN = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+
+def get_procurement_settings(chat_id: int) -> dict:
+    ids = get_chat_ids(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    placeholders = ','.join('?' * len(ids))
+    c.execute(f'SELECT weekly_budget, restock_day, auto_send, last_sent_date FROM procurement_settings WHERE chat_id IN ({placeholders}) LIMIT 1', ids)
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {'weekly_budget': row[0], 'restock_day': row[1], 'auto_send': bool(row[2]), 'last_sent_date': row[3]}
+    return {'weekly_budget': 0.0, 'restock_day': 1, 'auto_send': True, 'last_sent_date': ''}
+
+def set_procurement_budget(chat_id: int, amount: float):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''INSERT INTO procurement_settings (chat_id, weekly_budget)
+                 VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET weekly_budget=excluded.weekly_budget''',
+              (chat_id, amount))
+    conn.commit()
+    conn.close()
+
+def set_restock_day(chat_id: int, day: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''INSERT INTO procurement_settings (chat_id, restock_day)
+                 VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET restock_day=excluded.restock_day''',
+              (chat_id, day))
+    conn.commit()
+    conn.close()
+
+def update_last_sent_date(chat_id: int, date_str: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('UPDATE procurement_settings SET last_sent_date=? WHERE chat_id=?', (date_str, chat_id))
+    conn.commit()
+    conn.close()
+
+def parse_weekday(text: str) -> int:
+    t = text.lower().strip()
+    for i, name in enumerate(WEEKDAY_NAMES_JA):
+        if name in t:
+            return i
+    for i, name in enumerate(WEEKDAY_NAMES_EN):
+        if name.lower() in t:
+            return i
+    short_ja = ['月', '火', '水', '木', '金', '土', '日']
+    for i, ch in enumerate(short_ja):
+        if ch in t and '曜' not in t:
+            return i
+    return -1
 
 def is_supermarket_report(text: str) -> bool:
     t = text.lower()
@@ -807,6 +876,332 @@ async def ai_chat(text: str) -> str:
     )
     return resp.content[0].text.strip()
 
+
+# ─── Procurement: Web search + AI recommendation ─────────
+async def search_trending_products() -> list[dict]:
+    """Search for trending Japanese products using Brave Search API."""
+    if not BRAVE_SEARCH_API_KEY:
+        logger.warning("BRAVE_SEARCH_API_KEY not set — skipping web search")
+        return []
+    queries = [
+        ("日本スーパー", "日本 スーパー トレンド商品 人気 2026"),
+        ("ドンキホーテ", "ドンキホーテ 人気商品 売れ筋 ランキング"),
+        ("SNSバズ", "日本 食品 SNS バズ TikTok Instagram 話題"),
+        ("フィリピン人気", "Japanese products popular Philippines grocery snacks"),
+    ]
+    results = []
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        async def _search(category: str, query: str):
+            try:
+                resp = await client.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    params={"q": query, "count": 5},
+                    headers={"Accept": "application/json", "Accept-Encoding": "gzip",
+                             "X-Subscription-Token": BRAVE_SEARCH_API_KEY},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                for item in data.get("web", {}).get("results", [])[:5]:
+                    results.append({
+                        "category": category,
+                        "title": item.get("title", ""),
+                        "description": item.get("description", ""),
+                        "url": item.get("url", ""),
+                    })
+            except Exception as e:
+                logger.error(f"Brave search failed for '{category}': {e}")
+        await asyncio.gather(*[_search(cat, q) for cat, q in queries])
+    return results
+
+def get_category_sales_summary(chat_id: int, days: int = 30) -> str:
+    """Aggregate category sales for the past N days and return a text summary."""
+    records = get_records(chat_id, days=days)
+    if not records:
+        return "売上データなし"
+    cat_cols = [k for k in records[0].keys() if k.startswith('cat_')]
+    totals = {col: sum(r.get(col, 0) or 0 for r in records) for col in cat_cols}
+    grand = sum(totals.values())
+    half = len(records) // 2
+    first_half = records[:half] if half > 0 else records
+    second_half = records[half:] if half > 0 else records
+    lines = [f"過去{days}日のカテゴリ別売上（{len(records)}日分）:"]
+    sorted_cats = sorted(totals.items(), key=lambda x: x[1], reverse=True)
+    for col, total in sorted_cats:
+        if total <= 0:
+            continue
+        pct = total / grand * 100 if grand > 0 else 0
+        label = CAT_LABELS.get(col, col.replace('cat_', '').replace('_', ' ').title())
+        first_sum = sum(r.get(col, 0) or 0 for r in first_half)
+        second_sum = sum(r.get(col, 0) or 0 for r in second_half)
+        if first_sum > 0:
+            trend_pct = (second_sum - first_sum) / first_sum * 100
+            trend = f"↑{trend_pct:.0f}%" if trend_pct > 5 else (f"↓{abs(trend_pct):.0f}%" if trend_pct < -5 else "→横ばい")
+        else:
+            trend = "—"
+        lines.append(f"  {label}: ₱{total:,.0f} ({pct:.1f}%) {trend}")
+    return "\n".join(lines)
+
+async def generate_procurement_recommendation(chat_id: int, budget: float) -> str:
+    """Generate AI-powered procurement recommendation using web trends + store data."""
+    loop = asyncio.get_event_loop()
+    search_results, sales_summary = await asyncio.gather(
+        search_trending_products(),
+        loop.run_in_executor(None, get_category_sales_summary, chat_id, 30),
+    )
+    search_text = ""
+    if search_results:
+        for cat in ["日本スーパー", "ドンキホーテ", "SNSバズ", "フィリピン人気"]:
+            items = [r for r in search_results if r["category"] == cat]
+            if items:
+                search_text += f"\n【{cat}】\n"
+                for r in items:
+                    search_text += f"- {r['title']}: {r['description'][:150]}\n"
+    else:
+        search_text = "（Web検索結果なし — Brave Search APIキー未設定または検索失敗）"
+    now = datetime.now(PHT)
+    system_prompt = (
+        "あなたは「みどりのマート」（フィリピンにある日本食品スーパー）の仕入れアドバイザーです。\n"
+        "日本から商品を仕入れてフィリピンで販売しています。\n"
+        "以下の情報を基に、今週の仕入れ提案をJSON形式で作成してください。\n\n"
+        "必ず以下のJSON形式のみを返してください（説明文不要）:\n"
+        '{\n'
+        '  "categories": [\n'
+        '    {\n'
+        '      "name": "カテゴリ名",\n'
+        '      "budget": カテゴリ予算（円・整数）,\n'
+        '      "reason": "このカテゴリの仕入れ理由（1文）",\n'
+        '      "items": [\n'
+        '        {"name": "商品名", "unit_price": 単価（円・整数）, "qty": 数量（整数）, "source": "定番" or "トレンド", "note": "補足（任意）"}\n'
+        '      ]\n'
+        '    }\n'
+        '  ],\n'
+        '  "summary": "全体コメント（季節性・トレンドを踏まえた総括）"\n'
+        '}\n\n'
+        "注意事項:\n"
+        f"- 予算総額は ¥{budget:,.0f}（日本円）です。各カテゴリのbudgetの合計が予算総額以内になるようにしてください\n"
+        f"- 各商品の unit_price × qty の合計がカテゴリbudget以内になるようにしてください\n"
+        "- 日本で仕入れてフィリピンで販売する前提です\n"
+        f"- 季節性（現在{now.month}月）を考慮してください\n"
+        "- 5〜8カテゴリ、各カテゴリ2〜5商品程度\n"
+        "- JSON以外のテキストは一切含めないでください"
+    )
+    user_msg = (
+        f"【店舗売上データ（過去30日）】\n{sales_summary}\n\n"
+        f"【日本のトレンド商品情報（ウェブ検索結果）】\n{search_text}\n\n"
+        f"上記を踏まえ、今週の仕入れ提案を ¥{budget:,.0f} の予算内でJSON形式で作成してください。"
+    )
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
+    try:
+        resp = await asyncio.wait_for(
+            client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=3000,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_msg}],
+            ),
+            timeout=60,
+        )
+        raw = resp.content[0].text.strip()
+        # Extract JSON from possible markdown code block
+        if raw.startswith('```'):
+            raw = re.sub(r'^```\w*\n?', '', raw)
+            raw = re.sub(r'\n?```$', '', raw)
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.error(f"Procurement AI JSON parse failed: {e}\nRaw: {raw[:500]}")
+        return None
+    except Exception as e:
+        logger.error(f"Procurement AI generation failed: {e}")
+        return None
+
+# ─── Procurement: proposal storage & approval flow ────────
+# In-memory storage for pending proposals {chat_id: proposal_data}
+_pending_proposals: dict[int, dict] = {}
+
+def format_proposal_message(proposal: dict, chat_id: int) -> str:
+    """Format a structured proposal into a readable Telegram message."""
+    lines = []
+    grand_total = 0
+    for ci, cat in enumerate(proposal.get('categories', [])):
+        cat_name = cat['name']
+        cat_budget = cat.get('budget', 0)
+        cat_reason = cat.get('reason', '')
+        items = cat.get('items', [])
+        cat_actual = sum(it.get('unit_price', 0) * it.get('qty', 0) for it in items)
+        grand_total += cat_actual
+        status = _pending_proposals.get(chat_id, {}).get('status', {})
+        cat_status = status.get(ci, 'pending')
+        icon = {'approved': '✅', 'rejected': '❌', 'pending': '⏳'}.get(cat_status, '⏳')
+        lines.append(f"\n{icon} 【{cat_name}】予算: ¥{cat_budget:,} | 小計: ¥{cat_actual:,}")
+        if cat_reason:
+            lines.append(f"   {cat_reason}")
+        for ii, item in enumerate(items):
+            name = item['name']
+            price = item.get('unit_price', 0)
+            qty = item.get('qty', 0)
+            total = price * qty
+            source = item.get('source', '')
+            note = item.get('note', '')
+            src_icon = '🔄' if source == '定番' else '🆕'
+            note_str = f" ({note})" if note else ""
+            lines.append(f"   {src_icon} {name}: ¥{price:,} × {qty}個 = ¥{total:,}{note_str}")
+    lines.append(f"\n━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"💰 合計: ¥{grand_total:,}")
+    budget = _pending_proposals.get(chat_id, {}).get('budget', 0)
+    if budget > 0:
+        remaining = budget - grand_total
+        lines.append(f"📊 予算: ¥{budget:,} | 残り: ¥{remaining:,}")
+    summary = proposal.get('summary', '')
+    if summary:
+        lines.append(f"\n💡 {summary}")
+    return "\n".join(lines)
+
+def make_category_keyboard(proposal: dict, chat_id: int) -> InlineKeyboardMarkup:
+    """Create inline keyboard with approve/reject buttons for each category."""
+    buttons = []
+    status = _pending_proposals.get(chat_id, {}).get('status', {})
+    for ci, cat in enumerate(proposal.get('categories', [])):
+        cat_status = status.get(ci, 'pending')
+        cat_name = cat['name']
+        if cat_status == 'pending':
+            buttons.append([
+                InlineKeyboardButton(f"✅ {cat_name}", callback_data=f"proc_approve_{ci}"),
+                InlineKeyboardButton(f"❌", callback_data=f"proc_reject_{ci}"),
+                InlineKeyboardButton(f"📝 数量変更", callback_data=f"proc_edit_{ci}"),
+            ])
+        elif cat_status == 'approved':
+            buttons.append([
+                InlineKeyboardButton(f"✅ {cat_name} (承認済)", callback_data=f"proc_undo_{ci}"),
+            ])
+        elif cat_status == 'rejected':
+            buttons.append([
+                InlineKeyboardButton(f"❌ {cat_name} (却下)", callback_data=f"proc_undo_{ci}"),
+            ])
+    # Bottom action buttons
+    all_decided = all(status.get(i, 'pending') != 'pending' for i in range(len(proposal.get('categories', []))))
+    if all_decided:
+        buttons.append([InlineKeyboardButton("📋 確定して注文リスト出力", callback_data="proc_finalize")])
+    buttons.append([InlineKeyboardButton("✅ 全て承認", callback_data="proc_approve_all"),
+                    InlineKeyboardButton("🔄 リセット", callback_data="proc_reset")])
+    return InlineKeyboardMarkup(buttons)
+
+def make_item_keyboard(cat_index: int, items: list) -> InlineKeyboardMarkup:
+    """Create inline keyboard for editing item quantities within a category."""
+    buttons = []
+    for ii, item in enumerate(items):
+        name = item['name'][:12]
+        qty = item.get('qty', 0)
+        buttons.append([
+            InlineKeyboardButton(f"➖", callback_data=f"proc_qty_{cat_index}_{ii}_dec"),
+            InlineKeyboardButton(f"{name}: {qty}個", callback_data=f"proc_qty_{cat_index}_{ii}_info"),
+            InlineKeyboardButton(f"➕", callback_data=f"proc_qty_{cat_index}_{ii}_inc"),
+        ])
+    buttons.append([InlineKeyboardButton("🔙 戻る", callback_data=f"proc_back_{cat_index}")])
+    return InlineKeyboardMarkup(buttons)
+
+async def handle_procurement_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle all procurement-related inline button callbacks."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    data = query.data
+
+    if chat_id not in _pending_proposals:
+        await query.edit_message_text("⚠️ 提案データが見つかりません。再度「仕入れ提案」を実行してください。")
+        return
+
+    prop = _pending_proposals[chat_id]
+    proposal = prop['proposal']
+    status = prop['status']
+
+    if data.startswith('proc_approve_') and not data.startswith('proc_approve_all'):
+        ci = int(data.split('_')[-1])
+        status[ci] = 'approved'
+    elif data.startswith('proc_reject_'):
+        ci = int(data.split('_')[-1])
+        status[ci] = 'rejected'
+    elif data.startswith('proc_undo_'):
+        ci = int(data.split('_')[-1])
+        status[ci] = 'pending'
+    elif data == 'proc_approve_all':
+        for i in range(len(proposal.get('categories', []))):
+            status[i] = 'approved'
+    elif data == 'proc_reset':
+        for i in range(len(proposal.get('categories', []))):
+            status[i] = 'pending'
+    elif data.startswith('proc_edit_'):
+        ci = int(data.split('_')[-1])
+        cat = proposal['categories'][ci]
+        items = cat.get('items', [])
+        cat_name = cat['name']
+        item_lines = []
+        for ii, item in enumerate(items):
+            item_lines.append(f"{item['name']}: ¥{item.get('unit_price',0):,} × {item.get('qty',0)}個 = ¥{item.get('unit_price',0)*item.get('qty',0):,}")
+        text = f"📝 【{cat_name}】数量変更\n━━━━━━━━━━━━━━━━━━━\n" + "\n".join(item_lines)
+        keyboard = make_item_keyboard(ci, items)
+        await query.edit_message_text(text=text, reply_markup=keyboard)
+        return
+    elif data.startswith('proc_qty_'):
+        parts = data.split('_')
+        ci = int(parts[2])
+        ii = int(parts[3])
+        action = parts[4]
+        cat = proposal['categories'][ci]
+        items = cat.get('items', [])
+        if action == 'inc':
+            items[ii]['qty'] = items[ii].get('qty', 0) + 1
+        elif action == 'dec':
+            items[ii]['qty'] = max(0, items[ii].get('qty', 0) - 1)
+        elif action == 'info':
+            return
+        cat_name = cat['name']
+        item_lines = []
+        cat_total = 0
+        for it in items:
+            t = it.get('unit_price', 0) * it.get('qty', 0)
+            cat_total += t
+            item_lines.append(f"{it['name']}: ¥{it.get('unit_price',0):,} × {it.get('qty',0)}個 = ¥{t:,}")
+        text = f"📝 【{cat_name}】数量変更  小計: ¥{cat_total:,}\n━━━━━━━━━━━━━━━━━━━\n" + "\n".join(item_lines)
+        keyboard = make_item_keyboard(ci, items)
+        await query.edit_message_text(text=text, reply_markup=keyboard)
+        return
+    elif data.startswith('proc_back_'):
+        ci = int(data.split('_')[-1])
+        # Return to main proposal view
+        text = format_proposal_message(proposal, chat_id)
+        keyboard = make_category_keyboard(proposal, chat_id)
+        await query.edit_message_text(text=text, reply_markup=keyboard)
+        return
+    elif data == 'proc_finalize':
+        # Generate final order list with only approved categories
+        lines = ["📋 最終注文リスト\n━━━━━━━━━━━━━━━━━━━"]
+        grand_total = 0
+        for ci, cat in enumerate(proposal.get('categories', [])):
+            if status.get(ci) != 'approved':
+                continue
+            cat_name = cat['name']
+            items = cat.get('items', [])
+            cat_total = sum(it.get('unit_price', 0) * it.get('qty', 0) for it in items if it.get('qty', 0) > 0)
+            grand_total += cat_total
+            lines.append(f"\n【{cat_name}】¥{cat_total:,}")
+            for item in items:
+                if item.get('qty', 0) > 0:
+                    t = item['unit_price'] * item['qty']
+                    lines.append(f"  {item['name']}: {item['qty']}個 (¥{t:,})")
+        lines.append(f"\n━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"💰 注文合計: ¥{grand_total:,}")
+        budget = prop.get('budget', 0)
+        if budget > 0:
+            lines.append(f"📊 予算: ¥{budget:,} | 残り: ¥{budget - grand_total:,}")
+        lines.append(f"\n✅ 注文リスト確定 ({datetime.now(PHT).strftime('%Y-%m-%d %H:%M')})")
+        await query.edit_message_text(text="\n".join(lines))
+        del _pending_proposals[chat_id]
+        return
+
+    # Update main view
+    text = format_proposal_message(proposal, chat_id)
+    keyboard = make_category_keyboard(proposal, chat_id)
+    await query.edit_message_text(text=text, reply_markup=keyboard)
 
 # ─── Alerts ────────────────────────────────────────────────
 def _has_graveyard_shift(date_str: str) -> bool:
@@ -1891,6 +2286,15 @@ def detect_intent(text: str) -> Optional[str]:
         return 'view_target'
     if re.search(r'\d{1,2}[/月]\d{1,2}', t) and any(k in t for k in ['確認', 'データ', 'check', '記録', '見せ', '見て']):
         return 'check_date'
+    # Procurement intents
+    if any(k in t for k in ['仕入れ', '仕入', 'procurement', '発注提案', '入荷提案']):
+        if any(k in t for k in ['予算', 'budget']):
+            return 'set_procurement_budget'
+        if any(k in t for k in ['曜日', '日に', '日を', 'day', 'restock']):
+            return 'set_restock_day'
+        if any(k in t for k in ['設定確認', '設定を確認', 'settings', '確認']):
+            return 'view_procurement_settings'
+        return 'procurement'
     return None
 
 def is_bot_mentioned(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1920,7 +2324,12 @@ HELP_TEXT = """🤖 話しかけてくれてありがとう！
 🎯 「目標確認」— 現在の目標を表示
 
 🗑️ 「最新レポートを削除」— 最新データ削除
-🗑️ 「2026-03-08のレポートを削除」— 日付指定削除"""
+🗑️ 「2026-03-08のレポートを削除」— 日付指定削除
+
+📦 「仕入れ提案」— AI仕入れ推薦
+📦 「仕入れ予算を50000に設定」— 週間予算設定
+📦 「仕入れ日を火曜に設定」— 仕入れ曜日設定
+📦 「仕入れ設定確認」— 現在の設定を表示"""
 
 # ─── Main message handler ──────────────────────────────────
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2123,6 +2532,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == 'reset_target':   await cmd_reset_target(update, ctx, text)
     elif intent == 'view_target':    await cmd_view_target(update, ctx)
     elif intent == 'check_date':     await cmd_check_date(update, ctx, text)
+    elif intent == 'procurement':              await cmd_procurement(update, ctx)
+    elif intent == 'set_procurement_budget':   await cmd_set_procurement_budget(update, ctx, text)
+    elif intent == 'set_restock_day':          await cmd_set_restock_day(update, ctx, text)
+    elif intent == 'view_procurement_settings': await cmd_view_procurement_settings(update, ctx)
     else:
         try:
             reply_text = await ai_chat(text)
@@ -2286,6 +2699,47 @@ async def auto_weekly_report_job(ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"auto_weekly_report_job failed: {e}")
 
+async def auto_procurement_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """Runs daily at 20:00 PHT — if tomorrow is restock day, sends procurement recommendations."""
+    now = datetime.now(PHT)
+    tomorrow = (now + timedelta(days=1)).weekday()
+    today_str = now.strftime('%Y-%m-%d')
+    target_chats = []
+    if WEEKLY_REPORT_CHAT_ID:
+        target_chats.append(WEEKLY_REPORT_CHAT_ID)
+    if OWNER_CHAT_ID and OWNER_CHAT_ID not in target_chats:
+        target_chats.append(OWNER_CHAT_ID)
+    for chat_id in target_chats:
+        try:
+            settings = get_procurement_settings(chat_id)
+            if not settings['auto_send'] or settings['weekly_budget'] <= 0:
+                continue
+            if tomorrow != settings['restock_day']:
+                continue
+            if settings['last_sent_date'] == today_str:
+                continue
+            budget = settings['weekly_budget']
+            proposal = await generate_procurement_recommendation(chat_id, budget)
+            if proposal is None:
+                logger.warning(f"auto_procurement_job: AI generation failed for {chat_id}")
+                continue
+            day_name = WEEKDAY_NAMES_JA[settings['restock_day']]
+            num_cats = len(proposal.get('categories', []))
+            _pending_proposals[chat_id] = {
+                'proposal': proposal,
+                'budget': budget,
+                'status': {i: 'pending' for i in range(num_cats)},
+            }
+            header = f"📦🔔 明日は仕入れ日（{day_name}）です！\n予算: ¥{budget:,.0f}\n"
+            text = header + format_proposal_message(proposal, chat_id)
+            keyboard = make_category_keyboard(proposal, chat_id)
+            sent = await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+            save_bot_message(chat_id, sent.message_id)
+            update_last_sent_date(chat_id, today_str)
+            logger.info(f"auto_procurement_job: sent recommendation to {chat_id}")
+        except Exception as e:
+            logger.error(f"auto_procurement_job failed for {chat_id}: {e}")
+
 # ─── Target commands ────────────────────────────────────────
 async def cmd_set_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
     chat_id = update.effective_chat.id
@@ -2388,6 +2842,92 @@ async def cmd_check_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: s
         sent = await update.message.reply_text("\n".join(lines))
     save_bot_message(chat_id, sent.message_id)
 
+# ─── Procurement commands ─────────────────────────────────
+async def cmd_procurement(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Generate and send procurement recommendation with approval buttons."""
+    chat_id = update.effective_chat.id
+    settings = get_procurement_settings(chat_id)
+    budget = settings['weekly_budget']
+    if budget <= 0:
+        sent = await update.message.reply_text(
+            "⚠️ 仕入れ予算が設定されていません。\n"
+            "先に予算を設定してください:\n"
+            "例: 「仕入れ予算を50000に設定」"
+        )
+        save_bot_message(chat_id, sent.message_id)
+        return
+    waiting = await update.message.reply_text("⏳ 仕入れ提案を生成中...\n（トレンド検索 + AI分析、30秒ほどお待ちください）")
+    save_bot_message(chat_id, waiting.message_id)
+    proposal = await generate_procurement_recommendation(chat_id, budget)
+    if proposal is None:
+        sent = await ctx.bot.send_message(chat_id=chat_id, text="⚠️ 仕入れ提案の生成に失敗しました。しばらく経ってから再度お試しください。")
+        save_bot_message(chat_id, sent.message_id)
+        return
+    # Store proposal for approval flow
+    num_cats = len(proposal.get('categories', []))
+    _pending_proposals[chat_id] = {
+        'proposal': proposal,
+        'budget': budget,
+        'status': {i: 'pending' for i in range(num_cats)},
+    }
+    day_name = WEEKDAY_NAMES_JA[settings['restock_day']]
+    header = f"📦 今週の仕入れ提案（予算: ¥{budget:,.0f}）\n仕入れ日: {day_name}\n"
+    text = header + format_proposal_message(proposal, chat_id)
+    keyboard = make_category_keyboard(proposal, chat_id)
+    sent = await ctx.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+    save_bot_message(chat_id, sent.message_id)
+
+async def cmd_set_procurement_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    """Set weekly procurement budget."""
+    chat_id = update.effective_chat.id
+    nums = re.findall(r'[\d,]+(?:\.\d+)?', text.replace(',', ''))
+    if not nums:
+        sent = await update.message.reply_text("⚠️ 金額が読み取れませんでした。\n例: 「仕入れ予算を50000に設定」")
+        save_bot_message(chat_id, sent.message_id)
+        return
+    amount = float(nums[0].replace(',', ''))
+    set_procurement_budget(chat_id, amount)
+    sent = await update.message.reply_text(f"✅ 週間仕入れ予算を ¥{amount:,.0f} に設定しました。")
+    save_bot_message(chat_id, sent.message_id)
+
+async def cmd_set_restock_day(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    """Set restock day of the week."""
+    chat_id = update.effective_chat.id
+    day = parse_weekday(text)
+    if day < 0:
+        sent = await update.message.reply_text(
+            "⚠️ 曜日が読み取れませんでした。\n"
+            "例: 「仕入れ日を火曜日に設定」"
+        )
+        save_bot_message(chat_id, sent.message_id)
+        return
+    set_restock_day(chat_id, day)
+    day_name = WEEKDAY_NAMES_JA[day]
+    prev_day = WEEKDAY_NAMES_JA[(day - 1) % 7]
+    sent = await update.message.reply_text(
+        f"✅ 仕入れ日を{day_name}に設定しました。\n"
+        f"毎週{prev_day}の20:00に仕入れ提案を自動送信します。"
+    )
+    save_bot_message(chat_id, sent.message_id)
+
+async def cmd_view_procurement_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show current procurement settings."""
+    chat_id = update.effective_chat.id
+    settings = get_procurement_settings(chat_id)
+    day_name = WEEKDAY_NAMES_JA[settings['restock_day']]
+    prev_day = WEEKDAY_NAMES_JA[(settings['restock_day'] - 1) % 7]
+    budget_str = f"¥{settings['weekly_budget']:,.0f}" if settings['weekly_budget'] > 0 else "未設定"
+    auto_str = f"ON（{prev_day} 20:00）" if settings['auto_send'] else "OFF"
+    sent = await update.message.reply_text(
+        f"📦 仕入れ設定\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"週間予算: {budget_str}\n"
+        f"仕入れ日: {day_name}\n"
+        f"自動送信: {auto_str}\n"
+        f"最終送信: {settings['last_sent_date'] or 'なし'}"
+    )
+    save_bot_message(chat_id, sent.message_id)
+
 # ─── Main ──────────────────────────────────────────────────
 def main():
     init_db()
@@ -2409,6 +2949,7 @@ def main():
     app.add_handler(TypeHandler(Update, _log_raw_update), group=-1)
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(handle_procurement_callback, pattern=r'^proc_'))
 
     # Schedule auto weekly report every Monday 8:00 AM PHT (UTC+8 = UTC 0:00)
     if WEEKLY_REPORT_CHAT_ID and app.job_queue:
@@ -2431,6 +2972,13 @@ def main():
             name='auto_staff_performance',
         )
         logger.info("Monthly report + staff performance scheduled: 1st of month 08:00 PHT")
+        # Procurement auto-recommendation: daily 20:00 PHT, sends if tomorrow is restock day
+        app.job_queue.run_daily(
+            auto_procurement_job,
+            time=dtime(20, 0, tzinfo=PHT),
+            name='auto_procurement',
+        )
+        logger.info("Procurement auto-recommendation scheduled: daily 20:00 PHT check")
     elif not WEEKLY_REPORT_CHAT_ID:
         logger.info("WEEKLY_REPORT_CHAT_ID not set — auto weekly report disabled")
 
