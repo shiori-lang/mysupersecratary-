@@ -338,7 +338,7 @@ def get_daily_target(chat_id: int, date_str: str) -> float:
     try:
         wd = datetime.strptime(date_str, '%Y-%m-%d').weekday()  # 0=Mon … 6=Sun
     except ValueError:
-        wd = datetime.now().weekday()
+        wd = datetime.now(PHT).weekday()
     if wd <= 3:   target_type = 'daily_mon_thu'   # Mon-Thu
     elif wd == 4: target_type = 'daily_fri'        # Fri
     else:         target_type = 'daily_sat_sun'    # Sat-Sun
@@ -353,7 +353,7 @@ def is_supermarket_report(text: str) -> bool:
         'maya':           'maya' in t,
         'card/credit':    'card sale' in t or 'credit' in t,
         'previous sales': 'previous sales' in t,
-        'morning':        'morning' in t,
+        'morning':        'morning' in t or 'graveyard' in t or ' gy ' in t or t.startswith('gy'),
         'transaction':    'transaction' in t,
         'date today':     'date today' in t,
     }
@@ -439,7 +439,7 @@ def parse_report(text: str) -> dict:
     d['grab']        = _num(text, 'Grab')
     d['foodpanda']   = _num(text, 'Foodpanda')
 
-    gv = re.search(r'Grave\s*yard(?:\s*shift)?\s*:?\s*[₱]?\s*([\d,]+\.?\d*)', text, re.IGNORECASE)
+    gv = re.search(r'(?:Grave\s*yard(?:\s*shift)?|GY(?:\s*shift)?)\s*:?\s*[₱]?\s*([\d,]+\.?\d*)', text, re.IGNORECASE)
     d['graveyard']   = float(gv.group(1).replace(',', '')) if gv else 0.0
 
     d['morning']     = _num(text, 'Morning shift')
@@ -624,7 +624,7 @@ def get_chat_ids(chat_id: int) -> list:
 def get_records(chat_id: int, store: str = None, days: int = 30) -> list:
     conn = get_conn()
     c = conn.cursor()
-    since = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+    since = (datetime.now(PHT) - timedelta(days=days)).strftime('%Y-%m-%d')
     ids = get_chat_ids(chat_id)
     placeholders = ','.join('?' * len(ids))
     if store:
@@ -1997,6 +1997,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     _existing_raw = _row[0]
             except Exception:
                 pass
+            finally:
+                try:
+                    _conn.close()
+                except Exception:
+                    pass
             # 同じ内容（空白・改行を正規化して比較）→ スキップ
             def _normalize(t): return re.sub(r'\s+', ' ', (t or '').strip().lower())
             if _existing_raw and _normalize(_existing_raw) == _normalize(text):
