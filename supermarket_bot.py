@@ -1205,11 +1205,17 @@ async def handle_procurement_callback(update: Update, ctx: ContextTypes.DEFAULT_
 
 # ─── Alerts ────────────────────────────────────────────────
 def _has_graveyard_shift(date_str: str) -> bool:
-    """金〜日（weekday 4-6）のみGraveyardシフトあり"""
+    """金〜土（weekday 4-5）のみGraveyardシフトあり。日曜は8:00〜12:00のみ"""
     try:
-        return datetime.strptime(date_str, '%Y-%m-%d').weekday() >= 4
+        return datetime.strptime(date_str, '%Y-%m-%d').weekday() in (4, 5)
     except Exception:
         return False  # 日付不明の場合はGYシフトなしとみなす
+
+def _is_sunday(date_str: str) -> bool:
+    try:
+        return datetime.strptime(date_str, '%Y-%m-%d').weekday() == 6
+    except Exception:
+        return False
 
 def check_alerts(data: dict, prev: Optional[dict]) -> list:
     alerts = []
@@ -1252,10 +1258,13 @@ async def generate_ai_comment(data: dict, prev: Optional[dict]) -> str:
             comp = f"前日比: {pct:+.1f}%"
 
         has_gy = _has_graveyard_shift(data['date'])
-        shift_note = (
-            "【シフト体制】月〜木: Morning・Afternoonの2シフトのみ。金〜日: Morning・Afternoon・Graveyardの3シフト。"
-            + ("※本日はGraveyardシフトあり（金〜日）。" if has_gy else "※本日はGraveyardシフトなし（月〜木）のため、GY売上0は正常です。")
-        )
+        is_sun = _is_sunday(data['date'])
+        if has_gy:
+            shift_note = "【シフト体制】月〜木: Morning・Afternoonの2シフトのみ。金〜土: Morning・Afternoon・Graveyardの3シフト。日曜: Morningのみ（8:00〜12:00）。※本日はGraveyardシフトあり（金〜土）。"
+        elif is_sun:
+            shift_note = "【シフト体制】月〜木: Morning・Afternoonの2シフトのみ。金〜土: Morning・Afternoon・Graveyardの3シフト。日曜: Morningのみ（8:00〜12:00）。※本日は日曜日のため、Morningシフトのみ（8:00〜12:00）。GY・Afternoon売上0は正常です。"
+        else:
+            shift_note = "【シフト体制】月〜木: Morning・Afternoonの2シフトのみ。金〜土: Morning・Afternoon・Graveyardの3シフト。日曜: Morningのみ（8:00〜12:00）。※本日はGraveyardシフトなし（月〜木）のため、GY売上0は正常です。"
 
         # トップカテゴリ（上位3件）
         cat_total = sum(data.get(k, 0) for _, k in CAT_LABELS)
