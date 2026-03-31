@@ -205,6 +205,41 @@ def init_db():
             last_sent_date TEXT DEFAULT ''
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS order_history (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id     INTEGER NOT NULL,
+            ordered_at  TEXT NOT NULL,
+            category    TEXT NOT NULL,
+            item_name   TEXT NOT NULL,
+            unit_price  INTEGER NOT NULL,
+            qty         INTEGER NOT NULL,
+            total       INTEGER NOT NULL,
+            source      TEXT DEFAULT '定番'
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS fixed_items (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id     INTEGER NOT NULL,
+            category    TEXT NOT NULL DEFAULT 'その他',
+            item_name   TEXT NOT NULL,
+            unit_price  INTEGER DEFAULT 0,
+            min_qty     INTEGER NOT NULL,
+            UNIQUE(chat_id, item_name)
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS inventory (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id     INTEGER NOT NULL,
+            item_name   TEXT NOT NULL,
+            category    TEXT NOT NULL DEFAULT 'その他',
+            qty         INTEGER NOT NULL DEFAULT 0,
+            updated_at  TEXT NOT NULL,
+            UNIQUE(chat_id, item_name)
+        )
+    ''')
     conn.commit()
     conn.close()
     logger.info("Database initialized.")
@@ -399,6 +434,134 @@ def update_last_sent_date(chat_id: int, date_str: str):
     c.execute('UPDATE procurement_settings SET last_sent_date=? WHERE chat_id=?', (date_str, chat_id))
     conn.commit()
     conn.close()
+
+# ─── Order history helpers ─────────────────────────────────
+def save_order_history(chat_id: int, approved_categories: list):
+    """Save finalized order items to order_history table."""
+    today = datetime.now(PHT).strftime('%Y-%m-%d')
+    conn = get_conn()
+    c = conn.cursor()
+    for cat in approved_categories:
+        cat_name = cat.get('name', '')
+        for item in cat.get('items', []):
+            if item.get('qty', 0) <= 0:
+                continue
+            qty = item['qty']
+            price = item.get('unit_price', 0)
+            c.execute(
+                'INSERT INTO order_history (chat_id, ordered_at, category, item_name, unit_price, qty, total, source) VALUES (?,?,?,?,?,?,?,?)',
+                (chat_id, today, cat_name, item['name'], price, qty, price * qty, item.get('source', '定番'))
+            )
+    conn.commit()
+    conn.close()
+
+def get_order_history_summary(chat_id: int, n: int = 3) -> str:
+    """Return a text summary of the last N order dates for AI context."""
+    ids = get_chat_ids(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    placeholders = ','.join('?' * len(ids))
+    c.execute(f'''
+        SELECT DISTINCT ordered_at FROM order_history
+        WHERE chat_id IN ({placeholders})
+        ORDER BY ordered_at DESC LIMIT ?
+    ''', (*ids, n))
+    dates = [row[0] for row in c.fetchall()]
+    if not dates:
+        conn.close()
+        return "（注文履歴なし）"
+    lines = []
+    for date in dates:
+        c.execute(f'''
+            SELECT category, item_name, qty, unit_price, total FROM order_history
+            WHERE chat_id IN ({placeholders}) AND ordered_at=?
+            ORDER BY category, item_name
+        ''', (*ids, date))
+        rows = c.fetchall()
+        total = sum(r[4] for r in rows)
+        items_str = ', '.join(f"{r[1]}×{r[2]}" for r in rows[:8])
+        if len(rows) > 8:
+            items_str += f" 他{len(rows)-8}品"
+        lines.append(f"  [{date}] 合計¥{total:,} — {items_str}")
+    conn.close()
+    return "\n".join(lines)
+
+def get_order_history_records(chat_id: int, days: int = 90) -> list:
+    """Return raw order history rows for CSV export."""
+    ids = get_chat_ids(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    placeholders = ','.join('?' * len(ids))
+    since = (datetime.now(PHT) - timedelta(days=days)).strftime('%Y-%m-%d')
+    c.execute(f'''
+        SELECT ordered_at, category, item_name, unit_price, qty, total, source
+        FROM order_history
+        WHERE chat_id IN ({placeholders}) AND ordered_at >= ?
+        ORDER BY ordered_at DESC, category, item_name
+    ''', (*ids, since))
+    rows = [{'ordered_at': r[0], 'category': r[1], 'item_name': r[2],
+             'unit_price': r[3], 'qty': r[4], 'total': r[5], 'source': r[6]}
+            for r in c.fetchall()]
+    conn.close()
+    return rows
+
+# ─── Fixed items helpers ───────────────────────────────────
+def add_fixed_item(chat_id: int, item_name: str, min_qty: int, unit_price: int = 0, category: str = 'その他'):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''INSERT INTO fixed_items (chat_id, category, item_name, unit_price, min_qty)
+                 VALUES (?,?,?,?,?)
+                 ON CONFLICT(chat_id, item_name) DO UPDATE SET
+                     min_qty=excluded.min_qty, unit_price=excluded.unit_price, category=excluded.category''',
+              (chat_id, category, item_name, unit_price, min_qty))
+    conn.commit()
+    conn.close()
+
+def get_fixed_items(chat_id: int) -> list:
+    ids = get_chat_ids(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    placeholders = ','.join('?' * len(ids))
+    c.execute(f'SELECT category, item_name, unit_price, min_qty FROM fixed_items WHERE chat_id IN ({placeholders}) ORDER BY category, item_name', ids)
+    rows = [{'category': r[0], 'item_name': r[1], 'unit_price': r[2], 'min_qty': r[3]} for r in c.fetchall()]
+    conn.close()
+    return rows
+
+def delete_fixed_item(chat_id: int, item_name: str) -> bool:
+    ids = get_chat_ids(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    placeholders = ','.join('?' * len(ids))
+    c.execute(f'DELETE FROM fixed_items WHERE chat_id IN ({placeholders}) AND item_name=?', (*ids, item_name))
+    deleted = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+# ─── Inventory helpers ─────────────────────────────────────
+def add_inventory(chat_id: int, item_name: str, category: str, qty_delta: int):
+    """Add (or subtract) qty from inventory. Creates record if not exists."""
+    now = datetime.now(PHT).strftime('%Y-%m-%d %H:%M')
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''INSERT INTO inventory (chat_id, item_name, category, qty, updated_at)
+                 VALUES (?,?,?,?,?)
+                 ON CONFLICT(chat_id, item_name) DO UPDATE SET
+                     qty = MAX(0, qty + excluded.qty),
+                     updated_at = excluded.updated_at''',
+              (chat_id, item_name, category, qty_delta, now))
+    conn.commit()
+    conn.close()
+
+def get_inventory(chat_id: int) -> list:
+    ids = get_chat_ids(chat_id)
+    conn = get_conn()
+    c = conn.cursor()
+    placeholders = ','.join('?' * len(ids))
+    c.execute(f'SELECT item_name, category, qty, updated_at FROM inventory WHERE chat_id IN ({placeholders}) ORDER BY category, item_name', ids)
+    rows = [{'item_name': r[0], 'category': r[1], 'qty': r[2], 'updated_at': r[3]} for r in c.fetchall()]
+    conn.close()
+    return rows
 
 def parse_weekday(text: str) -> int:
     t = text.lower().strip()
@@ -878,16 +1041,42 @@ async def ai_chat(text: str) -> str:
 
 
 # ─── Procurement: Web search + AI recommendation ─────────
+async def get_trend_fallback() -> list[dict]:
+    """Brave API未設定時にClaudeの知識ベースでトレンド商品を返す。"""
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
+    now = datetime.now(PHT)
+    try:
+        resp = await asyncio.wait_for(
+            client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=800,
+                messages=[{"role": "user", "content": (
+                    f"現在{now.year}年{now.month}月です。"
+                    "今の日本でSNS（TikTok・Instagram・X）でバズっている食品・スナック・飲料・カップ麺・お菓子などを"
+                    "具体的な商品名を挙げて教えてください。"
+                    "また、ドン・キホーテで最近売れ筋の食品商品も教えてください。"
+                    "さらに、フィリピン在住の日本食ファンに人気の日本食品・お菓子も教えてください。"
+                    "各カテゴリ5件程度、商品名と簡単な説明を箇条書きで返してください。"
+                )}]
+            ),
+            timeout=30,
+        )
+        text = resp.content[0].text.strip()
+        return [{"category": "SNSバズ（AIフォールバック）", "title": "Claudeによるトレンド情報", "description": text, "url": ""}]
+    except Exception as e:
+        logger.error(f"Trend fallback failed: {e}")
+        return []
+
 async def search_trending_products() -> list[dict]:
     """Search for trending Japanese products using Brave Search API."""
     if not BRAVE_SEARCH_API_KEY:
-        logger.warning("BRAVE_SEARCH_API_KEY not set — skipping web search")
-        return []
+        logger.info("BRAVE_SEARCH_API_KEY not set — using Claude fallback for trends")
+        return await get_trend_fallback()
     queries = [
-        ("日本スーパー", "日本 スーパー トレンド商品 人気 2026"),
-        ("ドンキホーテ", "ドンキホーテ 人気商品 売れ筋 ランキング"),
-        ("SNSバズ", "日本 食品 SNS バズ TikTok Instagram 話題"),
-        ("フィリピン人気", "Japanese products popular Philippines grocery snacks"),
+        ("日本スーパー", "ドンキホーテ おすすめ食品 スナック ランキング 2026"),
+        ("ドンキホーテ", "ドンキホーテ 激安 食品 人気商品 お菓子 売れ筋"),
+        ("SNSバズ", "TikTok Instagram バズり飯 食品 スナック お菓子 話題 2026"),
+        ("フィリピン人気", "Japanese snacks Filipino favorites Philippines TikTok popular 2026"),
     ]
     results = []
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -911,6 +1100,9 @@ async def search_trending_products() -> list[dict]:
             except Exception as e:
                 logger.error(f"Brave search failed for '{category}': {e}")
         await asyncio.gather(*[_search(cat, q) for cat, q in queries])
+    if not results:
+        logger.info("Brave search returned no results — using Claude fallback")
+        return await get_trend_fallback()
     return results
 
 def get_category_sales_summary(chat_id: int, days: int = 30) -> str:
@@ -944,10 +1136,12 @@ def get_category_sales_summary(chat_id: int, days: int = 30) -> str:
 async def generate_procurement_recommendation(chat_id: int, budget: float) -> str:
     """Generate AI-powered procurement recommendation using web trends + store data."""
     loop = asyncio.get_event_loop()
-    search_results, sales_summary = await asyncio.gather(
+    search_results, sales_summary, order_history_text = await asyncio.gather(
         search_trending_products(),
         loop.run_in_executor(None, get_category_sales_summary, chat_id, 30),
+        loop.run_in_executor(None, get_order_history_summary, chat_id, 3),
     )
+    fixed_items = get_fixed_items(chat_id)
     search_text = ""
     if search_results:
         for cat in ["日本スーパー", "ドンキホーテ", "SNSバズ", "フィリピン人気"]:
@@ -958,6 +1152,12 @@ async def generate_procurement_recommendation(chat_id: int, budget: float) -> st
                     search_text += f"- {r['title']}: {r['description'][:150]}\n"
     else:
         search_text = "（Web検索結果なし — Brave Search APIキー未設定または検索失敗）"
+    fixed_items_text = ""
+    if fixed_items:
+        fixed_items_text = "【固定アイテム（必ず提案に含めること）】\n"
+        for fi in fixed_items:
+            price_str = f"¥{fi['unit_price']:,}" if fi.get('unit_price') else "価格未設定"
+            fixed_items_text += f"- {fi['item_name']}（{fi['category']}）: 最低{fi['min_qty']}個, {price_str}\n"
     now = datetime.now(PHT)
     system_prompt = (
         "あなたは「みどりのマート」（フィリピンにある日本食品スーパー）の仕入れアドバイザーです。\n"
@@ -983,11 +1183,14 @@ async def generate_procurement_recommendation(chat_id: int, budget: float) -> st
         "- 日本で仕入れてフィリピンで販売する前提です\n"
         f"- 季節性（現在{now.month}月）を考慮してください\n"
         "- 5〜8カテゴリ、各カテゴリ2〜5商品程度\n"
-        "- JSON以外のテキストは一切含めないでください"
+        + ("- 固定アイテムは必ずいずれかのカテゴリに含め、指定の最低数量を守ってください\n" if fixed_items else "")
+        + "- JSON以外のテキストは一切含めないでください"
     )
     user_msg = (
         f"【店舗売上データ（過去30日）】\n{sales_summary}\n\n"
-        f"【日本のトレンド商品情報（ウェブ検索結果）】\n{search_text}\n\n"
+        + (f"【過去の注文履歴】\n{order_history_text}\n\n" if order_history_text and order_history_text != "注文履歴なし" else "")
+        + (f"{fixed_items_text}\n" if fixed_items_text else "")
+        + f"【日本のトレンド商品情報（ウェブ検索結果）】\n{search_text}\n\n"
         f"上記を踏まえ、今週の仕入れ提案を ¥{budget:,.0f} の予算内でJSON形式で作成してください。"
     )
     client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
@@ -1176,6 +1379,7 @@ async def handle_procurement_callback(update: Update, ctx: ContextTypes.DEFAULT_
         # Generate final order list with only approved categories
         lines = ["📋 最終注文リスト\n━━━━━━━━━━━━━━━━━━━"]
         grand_total = 0
+        approved_cats = []
         for ci, cat in enumerate(proposal.get('categories', [])):
             if status.get(ci) != 'approved':
                 continue
@@ -1188,13 +1392,46 @@ async def handle_procurement_callback(update: Update, ctx: ContextTypes.DEFAULT_
                 if item.get('qty', 0) > 0:
                     t = item['unit_price'] * item['qty']
                     lines.append(f"  {item['name']}: {item['qty']}個 (¥{t:,})")
+            approved_cats.append(cat)
         lines.append(f"\n━━━━━━━━━━━━━━━━━━━")
         lines.append(f"💰 注文合計: ¥{grand_total:,}")
         budget = prop.get('budget', 0)
         if budget > 0:
             lines.append(f"📊 予算: ¥{budget:,} | 残り: ¥{budget - grand_total:,}")
-        lines.append(f"\n✅ 注文リスト確定 ({datetime.now(PHT).strftime('%Y-%m-%d %H:%M')})")
+        confirmed_at = datetime.now(PHT).strftime('%Y-%m-%d %H:%M')
+        lines.append(f"\n✅ 注文リスト確定 ({confirmed_at})")
         await query.edit_message_text(text="\n".join(lines))
+        # 注文履歴をDBに保存
+        save_order_history(chat_id, approved_cats)
+        # 在庫に自動加算
+        for cat in approved_cats:
+            cat_name = cat.get('name', 'その他')
+            for item in cat.get('items', []):
+                if item.get('qty', 0) > 0:
+                    add_inventory(chat_id, item['name'], cat_name, item['qty'])
+        # CSV自動送信
+        today_str = datetime.now(PHT).strftime('%Y%m%d')
+        csv_buf = io.StringIO()
+        csv_buf.write('\ufeff')  # UTF-8 BOM
+        writer = csv.writer(csv_buf)
+        writer.writerow(['注文日', 'カテゴリ', '商品名', '単価(¥)', '数量', '合計(¥)', '種別'])
+        ordered_at = datetime.now(PHT).strftime('%Y-%m-%d')
+        for cat in approved_cats:
+            cat_name = cat.get('name', '')
+            for item in cat.get('items', []):
+                if item.get('qty', 0) > 0:
+                    writer.writerow([
+                        ordered_at, cat_name, item['name'],
+                        item.get('unit_price', 0), item['qty'],
+                        item.get('unit_price', 0) * item['qty'],
+                        item.get('source', '定番')
+                    ])
+        csv_bytes = csv_buf.getvalue().encode('utf-8-sig')
+        await query.message.reply_document(
+            document=io.BytesIO(csv_bytes),
+            filename=f"order_{today_str}.csv",
+            caption=f"📋 注文CSV ({confirmed_at})"
+        )
         del _pending_proposals[chat_id]
         return
 
@@ -1202,6 +1439,124 @@ async def handle_procurement_callback(update: Update, ctx: ContextTypes.DEFAULT_
     text = format_proposal_message(proposal, chat_id)
     keyboard = make_category_keyboard(proposal, chat_id)
     await query.edit_message_text(text=text, reply_markup=keyboard)
+
+# ─── Procurement: new command handlers ────────────────────────────────────────
+
+async def cmd_order_history_csv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """注文履歴CSVを送信するコマンド。"""
+    chat_id = update.effective_chat.id
+    records = get_order_history_records(chat_id, days=90)
+    if not records:
+        msg = await update.message.reply_text("📋 注文履歴がありません。")
+        save_bot_message(chat_id, msg.message_id)
+        return
+    csv_buf = io.StringIO()
+    writer = csv.writer(csv_buf)
+    writer.writerow(['注文日', 'カテゴリ', '商品名', '単価(¥)', '数量', '合計(¥)', '種別'])
+    for r in records:
+        writer.writerow([r['ordered_at'], r['category'], r['item_name'],
+                         r['unit_price'], r['qty'], r['total'], r.get('source', '定番')])
+    csv_bytes = csv_buf.getvalue().encode('utf-8-sig')
+    today_str = datetime.now(PHT).strftime('%Y%m%d')
+    sent = await update.message.reply_document(
+        document=io.BytesIO(csv_bytes),
+        filename=f"order_history_{today_str}.csv",
+        caption=f"📋 過去90日の注文履歴 ({len(records)}件)"
+    )
+    save_bot_message(chat_id, sent.message_id)
+
+async def cmd_add_fixed_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    """固定アイテムを追加。例: 固定アイテム追加 カップ麺 20個 ¥150"""
+    chat_id = update.effective_chat.id
+    # Parse: 固定アイテム追加 <商品名> <数量>個 [¥<単価>] [<カテゴリ>]
+    import re as _re
+    m = _re.search(r'固定アイテム追加\s+(.+?)\s+(\d+)個?(?:\s+[¥￥](\d+))?(?:\s+(.+))?$', text)
+    if not m:
+        msg = await update.message.reply_text(
+            "❌ 形式エラー。例:\n`固定アイテム追加 カップ麺 20個 ¥150`\n`固定アイテム追加 お茶 30個 ¥200 飲み物`",
+            parse_mode='Markdown'
+        )
+        save_bot_message(chat_id, msg.message_id)
+        return
+    item_name = m.group(1).strip()
+    min_qty = int(m.group(2))
+    unit_price = int(m.group(3)) if m.group(3) else 0
+    category = m.group(4).strip() if m.group(4) else 'その他'
+    add_fixed_item(chat_id, item_name, min_qty, unit_price, category)
+    price_str = f"¥{unit_price:,}" if unit_price else "価格未設定"
+    msg = await update.message.reply_text(
+        f"✅ 固定アイテム登録\n商品: {item_name}\nカテゴリ: {category}\n最低数量: {min_qty}個\n単価: {price_str}"
+    )
+    save_bot_message(chat_id, msg.message_id)
+
+async def cmd_list_fixed_items(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """固定アイテム一覧を表示。"""
+    chat_id = update.effective_chat.id
+    items = get_fixed_items(chat_id)
+    if not items:
+        msg = await update.message.reply_text("📋 固定アイテムが登録されていません。\n「固定アイテム追加 商品名 数量個 ¥単価」で登録できます。")
+        save_bot_message(chat_id, msg.message_id)
+        return
+    lines = ["📋 固定アイテム一覧\n━━━━━━━━━━━━━━━━━━━"]
+    for fi in items:
+        price_str = f"¥{fi['unit_price']:,}" if fi.get('unit_price') else "価格未設定"
+        lines.append(f"• {fi['item_name']}（{fi['category']}）: 最低{fi['min_qty']}個 / {price_str}")
+    lines.append(f"\n合計: {len(items)}件")
+    msg = await update.message.reply_text("\n".join(lines))
+    save_bot_message(chat_id, msg.message_id)
+
+async def cmd_delete_fixed_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    """固定アイテムを削除。例: 固定アイテム削除 カップ麺"""
+    chat_id = update.effective_chat.id
+    import re as _re
+    m = _re.search(r'固定アイテム削除\s+(.+)', text)
+    if not m:
+        msg = await update.message.reply_text("❌ 形式エラー。例: `固定アイテム削除 カップ麺`", parse_mode='Markdown')
+        save_bot_message(chat_id, msg.message_id)
+        return
+    item_name = m.group(1).strip()
+    deleted = delete_fixed_item(chat_id, item_name)
+    if deleted:
+        msg = await update.message.reply_text(f"✅ 「{item_name}」を固定アイテムから削除しました。")
+    else:
+        msg = await update.message.reply_text(f"❌ 「{item_name}」が見つかりません。「固定アイテム一覧」で確認してください。")
+    save_bot_message(chat_id, msg.message_id)
+
+async def cmd_inventory(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """在庫一覧を表示。"""
+    chat_id = update.effective_chat.id
+    items = get_inventory(chat_id)
+    if not items:
+        msg = await update.message.reply_text("📦 在庫データがありません。\n仕入れ確定時に自動で在庫が登録されます。")
+        save_bot_message(chat_id, msg.message_id)
+        return
+    by_cat: dict = {}
+    for it in items:
+        cat = it.get('category', 'その他')
+        by_cat.setdefault(cat, []).append(it)
+    lines = ["📦 在庫一覧\n━━━━━━━━━━━━━━━━━━━"]
+    for cat, cat_items in sorted(by_cat.items()):
+        lines.append(f"\n【{cat}】")
+        for it in cat_items:
+            lines.append(f"  • {it['item_name']}: {it['qty']}個（更新: {it['updated_at'][:10]}）")
+    msg = await update.message.reply_text("\n".join(lines))
+    save_bot_message(chat_id, msg.message_id)
+
+async def cmd_update_inventory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    """在庫を手動更新。例: 在庫更新 カップ麺 -10"""
+    chat_id = update.effective_chat.id
+    import re as _re
+    m = _re.search(r'在庫更新\s+(.+?)\s+([+-]?\d+)', text)
+    if not m:
+        msg = await update.message.reply_text("❌ 形式エラー。例:\n`在庫更新 カップ麺 -10`（10個売れた）\n`在庫更新 カップ麺 +5`（5個追加）", parse_mode='Markdown')
+        save_bot_message(chat_id, msg.message_id)
+        return
+    item_name = m.group(1).strip()
+    delta = int(m.group(2))
+    add_inventory(chat_id, item_name, 'その他', delta)
+    sign = "+" if delta >= 0 else ""
+    msg = await update.message.reply_text(f"✅ 在庫更新: {item_name} {sign}{delta}個")
+    save_bot_message(chat_id, msg.message_id)
 
 # ─── Alerts ────────────────────────────────────────────────
 def _has_graveyard_shift(date_str: str) -> bool:
@@ -2304,6 +2659,23 @@ def detect_intent(text: str) -> Optional[str]:
         if any(k in t for k in ['設定確認', '設定を確認', 'settings', '確認']):
             return 'view_procurement_settings'
         return 'procurement'
+    # Fixed item intents
+    if '固定アイテム' in text or 'fixed item' in t:
+        if any(k in text for k in ['追加', '登録', 'add']):
+            return 'fixed_item_add'
+        if any(k in text for k in ['一覧', 'リスト', 'list', '見せ', '確認']):
+            return 'fixed_item_list'
+        if any(k in text for k in ['削除', 'delete', '消して', '取り消し']):
+            return 'fixed_item_delete'
+        return 'fixed_item_list'
+    # Inventory intents
+    if any(k in text for k in ['在庫確認', '在庫一覧', '在庫リスト']):
+        return 'inventory_check'
+    if '在庫更新' in text:
+        return 'inventory_update'
+    # Order history CSV
+    if any(k in t for k in ['注文履歴', '注文csv', '注文 csv', 'order history', 'order csv']):
+        return 'order_history_csv'
     return None
 
 def is_bot_mentioned(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -2338,7 +2710,15 @@ HELP_TEXT = """🤖 話しかけてくれてありがとう！
 📦 「仕入れ提案」— AI仕入れ推薦
 📦 「仕入れ予算を50000に設定」— 週間予算設定
 📦 「仕入れ日を火曜に設定」— 仕入れ曜日設定
-📦 「仕入れ設定確認」— 現在の設定を表示"""
+📦 「仕入れ設定確認」— 現在の設定を表示
+
+📌 「固定アイテム追加 カップ麺 20個 ¥150」— 必ず仕入れる商品を登録
+📌 「固定アイテム一覧」— 固定アイテム一覧表示
+📌 「固定アイテム削除 カップ麺」— 固定アイテムを削除
+
+📦 「在庫確認」— 現在の在庫一覧
+📦 「在庫更新 カップ麺 -10」— 在庫を手動で更新
+📋 「注文履歴」— 過去90日の注文CSVを取得"""
 
 # ─── Main message handler ──────────────────────────────────
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2545,6 +2925,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == 'set_procurement_budget':   await cmd_set_procurement_budget(update, ctx, text)
     elif intent == 'set_restock_day':          await cmd_set_restock_day(update, ctx, text)
     elif intent == 'view_procurement_settings': await cmd_view_procurement_settings(update, ctx)
+    elif intent == 'fixed_item_add':           await cmd_add_fixed_item(update, ctx, text)
+    elif intent == 'fixed_item_list':          await cmd_list_fixed_items(update, ctx)
+    elif intent == 'fixed_item_delete':        await cmd_delete_fixed_item(update, ctx, text)
+    elif intent == 'inventory_check':          await cmd_inventory(update, ctx)
+    elif intent == 'inventory_update':         await cmd_update_inventory(update, ctx, text)
+    elif intent == 'order_history_csv':        await cmd_order_history_csv(update, ctx)
     else:
         try:
             reply_text = await ai_chat(text)
