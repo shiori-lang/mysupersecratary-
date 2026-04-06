@@ -240,6 +240,43 @@ def init_db():
             UNIQUE(chat_id, item_name)
         )
     ''')
+    # UTAK POS data tables
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS utak_inventory (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id       INTEGER NOT NULL,
+            imported_at   TEXT NOT NULL,
+            category      TEXT NOT NULL,
+            item_name     TEXT NOT NULL,
+            option        TEXT DEFAULT '',
+            beginning     REAL DEFAULT 0,
+            added         REAL DEFAULT 0,
+            deducted      REAL DEFAULT 0,
+            ending        REAL DEFAULT 0,
+            inv_value     REAL DEFAULT 0,
+            UNIQUE(chat_id, imported_at, category, item_name, option)
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS utak_sales (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id       INTEGER NOT NULL,
+            sale_date     TEXT NOT NULL,
+            sale_time     TEXT DEFAULT '',
+            transaction_id TEXT DEFAULT '',
+            receipt_no    TEXT DEFAULT '',
+            total         REAL DEFAULT 0,
+            payment_type  TEXT DEFAULT '',
+            category      TEXT NOT NULL,
+            item_name     TEXT NOT NULL,
+            option        TEXT DEFAULT '',
+            qty           REAL DEFAULT 0,
+            price_per_unit REAL DEFAULT 0,
+            gross_price   REAL DEFAULT 0,
+            cost          REAL DEFAULT 0,
+            cashier       TEXT DEFAULT ''
+        )
+    ''')
     conn.commit()
     conn.close()
     logger.info("Database initialized.")
@@ -562,6 +599,254 @@ def get_inventory(chat_id: int) -> list:
     rows = [{'item_name': r[0], 'category': r[1], 'qty': r[2], 'updated_at': r[3]} for r in c.fetchall()]
     conn.close()
     return rows
+
+# ─── UTAK POS data helpers ────────────────────────────────
+def _parse_float(val: str) -> float:
+    """CSV値を数値に変換。空文字やエラーは0.0。"""
+    try:
+        return float(val.strip().replace(',', '')) if val and val.strip() else 0.0
+    except (ValueError, TypeError):
+        return 0.0
+
+def _normalize_category(raw: str) -> str:
+    """'01 FROZEN ITEM' → 'FROZEN ITEM' のように番号プレフィックスを除去。"""
+    import re as _re
+    return _re.sub(r'^\d+\s+', '', raw.strip())
+
+def detect_utak_csv_type(header: list[str]) -> str:
+    """CSVヘッダーからinventory or transactionsを判定。"""
+    h = [c.lower().strip() for c in header]
+    if 'beginning' in h or 'inventory value' in h:
+        return 'inventory'
+    if 'transaction id' in h or 'receipt no.' in h:
+        return 'transactions'
+    return 'unknown'
+
+def import_utak_inventory_csv(chat_id: int, rows: list[dict]) -> int:
+    """UTAK在庫CSVをDBにインポート。戻り値は取り込み件数。"""
+    now = datetime.now(PHT).strftime('%Y-%m-%d')
+    conn = get_conn()
+    c = conn.cursor()
+    # 同日の既存データを削除して上書き
+    c.execute('DELETE FROM utak_inventory WHERE chat_id=? AND imported_at=?', (chat_id, now))
+    count = 0
+    for r in rows:
+        cat = _normalize_category(r.get('Category', ''))
+        item = r.get('Title', '').strip()
+        if not cat or not item:
+            continue
+        option = r.get('Option', '').strip()
+        ending = _parse_float(r.get('End', ''))
+        # 在庫0かつ値もない行はスキップ（UTAKの空行）
+        inv_val = _parse_float(r.get('Inventory Value', ''))
+        if ending == 0 and inv_val == 0 and not r.get('Beginning', '').strip():
+            continue
+        c.execute('''INSERT OR REPLACE INTO utak_inventory
+                     (chat_id, imported_at, category, item_name, option, beginning, added, deducted, ending, inv_value)
+                     VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                  (chat_id, now, cat, item, option,
+                   _parse_float(r.get('Beginning', '')),
+                   _parse_float(r.get('Added', '')),
+                   _parse_float(r.get('Deducted', '')),
+                   ending, inv_val))
+        count += 1
+    conn.commit()
+    conn.close()
+    return count
+
+def import_utak_sales_csv(chat_id: int, rows: list[dict]) -> int:
+    """UTAK売上CSVをDBにインポート。戻り値は取り込み件数。"""
+    conn = get_conn()
+    c = conn.cursor()
+    count = 0
+    for r in rows:
+        cat = r.get('Category', '').strip()
+        item = r.get('Item', '').strip()
+        if not cat or not item:
+            continue
+        # 日付をYYYY-MM-DD形式に変換
+        raw_date = r.get('Date', '').strip()
+        try:
+            sale_date = datetime.strptime(raw_date, '%d %b %Y').strftime('%Y-%m-%d')
+        except Exception:
+            sale_date = raw_date
+        qty = _parse_float(r.get('Quantity', ''))
+        if qty == 0:
+            continue
+        c.execute('''INSERT INTO utak_sales
+                     (chat_id, sale_date, sale_time, transaction_id, receipt_no, total,
+                      payment_type, category, item_name, option, qty, price_per_unit, gross_price, cost, cashier)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                  (chat_id, sale_date, r.get('Time', '').strip(),
+                   r.get('Transaction ID', '').strip(), r.get('Receipt No.', '').strip(),
+                   _parse_float(r.get('Total', '')), r.get('Payment Type', '').strip(),
+                   cat, item, r.get('Option', '').strip(), qty,
+                   _parse_float(r.get('Price per Unit', '')),
+                   _parse_float(r.get('Gross Price', '')),
+                   _parse_float(r.get('Cost', '')),
+                   r.get('Cashier', '').strip()))
+        count += 1
+    conn.commit()
+    conn.close()
+    return count
+
+def get_utak_low_stock(chat_id: int, threshold: int = 3) -> list[dict]:
+    """在庫が少ない（ending <= threshold）かつ売れている商品を取得。"""
+    conn = get_conn()
+    c = conn.cursor()
+    # 最新のインポート日を取得
+    c.execute('SELECT MAX(imported_at) FROM utak_inventory WHERE chat_id=?', (chat_id,))
+    row = c.fetchone()
+    if not row or not row[0]:
+        conn.close()
+        return []
+    latest = row[0]
+    c.execute('''SELECT category, item_name, option, ending, inv_value
+                 FROM utak_inventory
+                 WHERE chat_id=? AND imported_at=? AND ending > 0 AND ending <= ?
+                 ORDER BY ending ASC, category''',
+              (chat_id, latest, threshold))
+    items = [{'category': r[0], 'item_name': r[1], 'option': r[2], 'ending': r[3], 'inv_value': r[4]}
+             for r in c.fetchall()]
+    conn.close()
+    return items
+
+def get_utak_out_of_stock(chat_id: int) -> list[dict]:
+    """在庫切れ（ending <= 0）かつ過去に在庫があった商品。"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT MAX(imported_at) FROM utak_inventory WHERE chat_id=?', (chat_id,))
+    row = c.fetchone()
+    if not row or not row[0]:
+        conn.close()
+        return []
+    latest = row[0]
+    c.execute('''SELECT category, item_name, option, ending
+                 FROM utak_inventory
+                 WHERE chat_id=? AND imported_at=? AND ending <= 0 AND beginning > 0
+                 ORDER BY category, item_name''',
+              (chat_id, latest))
+    items = [{'category': r[0], 'item_name': r[1], 'option': r[2], 'ending': r[3]}
+             for r in c.fetchall()]
+    conn.close()
+    return items
+
+def get_utak_sales_top(chat_id: int, days: int = 7, limit: int = 30) -> list[dict]:
+    """過去N日の売上トップ商品。"""
+    since = (datetime.now(PHT) - timedelta(days=days)).strftime('%Y-%m-%d')
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''SELECT category, item_name, SUM(qty) as total_qty,
+                        SUM(gross_price) as total_sales, COUNT(*) as txn_count
+                 FROM utak_sales
+                 WHERE chat_id=? AND sale_date>=?
+                 GROUP BY category, item_name
+                 ORDER BY total_qty DESC
+                 LIMIT ?''', (chat_id, since, limit))
+    items = [{'category': r[0], 'item_name': r[1], 'total_qty': r[2],
+              'total_sales': r[3], 'txn_count': r[4]}
+             for r in c.fetchall()]
+    conn.close()
+    return items
+
+def get_utak_inventory_summary(chat_id: int) -> str:
+    """最新UTAKインベントリのカテゴリ別サマリーをテキストで返す。"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT MAX(imported_at) FROM utak_inventory WHERE chat_id=?', (chat_id,))
+    row = c.fetchone()
+    if not row or not row[0]:
+        conn.close()
+        return "UTAK在庫データなし"
+    latest = row[0]
+    c.execute('''SELECT category,
+                        COUNT(*) as items,
+                        SUM(CASE WHEN ending > 0 THEN 1 ELSE 0 END) as in_stock,
+                        SUM(CASE WHEN ending <= 0 AND beginning > 0 THEN 1 ELSE 0 END) as out_of_stock,
+                        SUM(CASE WHEN ending > 0 AND ending <= 3 THEN 1 ELSE 0 END) as low_stock,
+                        SUM(inv_value) as total_value
+                 FROM utak_inventory
+                 WHERE chat_id=? AND imported_at=?
+                 GROUP BY category
+                 ORDER BY total_value DESC''',
+              (chat_id, latest))
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return "UTAK在庫データなし"
+    lines = [f"📦 UTAK在庫サマリー（{latest}）\n━━━━━━━━━━━━━━━━━━━"]
+    total_items = 0
+    total_low = 0
+    total_out = 0
+    total_val = 0
+    for r in rows:
+        cat, items, in_stock, out_of_stock, low_stock, val = r
+        total_items += in_stock
+        total_low += low_stock
+        total_out += out_of_stock
+        total_val += val or 0
+        alerts = []
+        if out_of_stock > 0:
+            alerts.append(f"🔴{out_of_stock}品切")
+        if low_stock > 0:
+            alerts.append(f"🟡{low_stock}残少")
+        alert_str = f" ({', '.join(alerts)})" if alerts else ""
+        val_str = f"₱{val:,.0f}" if val else ""
+        lines.append(f"【{cat}】{in_stock}品 {val_str}{alert_str}")
+    lines.append(f"\n合計: {total_items}品在庫 | 🔴{total_out}品切 | 🟡{total_low}残少 | ₱{total_val:,.0f}")
+    return "\n".join(lines)
+
+async def generate_utak_reorder_ai(chat_id: int) -> str:
+    """UTAK在庫+売上データからAIで仕入れ提案を生成。"""
+    loop = asyncio.get_event_loop()
+    low_stock = get_utak_low_stock(chat_id, threshold=5)
+    out_of_stock = get_utak_out_of_stock(chat_id)
+    top_sellers = get_utak_sales_top(chat_id, days=7)
+    if not low_stock and not out_of_stock and not top_sellers:
+        return "UTAKデータが不足しています。まず在庫CSV・売上CSVをボットに送ってください。"
+    # Build context
+    ctx_parts = []
+    if out_of_stock:
+        lines = ["【在庫切れ商品】"]
+        for it in out_of_stock[:30]:
+            opt = f" ({it['option']})" if it.get('option') else ""
+            lines.append(f"- {it['item_name']}{opt}（{it['category']}）")
+        ctx_parts.append("\n".join(lines))
+    if low_stock:
+        lines = ["【在庫残少商品（5個以下）】"]
+        for it in low_stock[:30]:
+            opt = f" ({it['option']})" if it.get('option') else ""
+            lines.append(f"- {it['item_name']}{opt}（{it['category']}）: 残{it['ending']:.0f}個")
+        ctx_parts.append("\n".join(lines))
+    if top_sellers:
+        lines = ["【過去7日の売上トップ商品】"]
+        for it in top_sellers[:20]:
+            lines.append(f"- {it['item_name']}（{it['category']}）: {it['total_qty']:.0f}個売上, ₱{it['total_sales']:,.0f}")
+        ctx_parts.append("\n".join(lines))
+    data_text = "\n\n".join(ctx_parts)
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
+    try:
+        resp = await asyncio.wait_for(
+            client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=2000,
+                system=(
+                    "あなたは「みどりのマート」（フィリピンにある日本食品スーパー）の在庫管理アドバイザーです。\n"
+                    "以下のUTAK POSデータを分析し、仕入れが必要な商品リストを作成してください。\n"
+                    "優先度をつけて、理由も簡潔に説明してください。\n"
+                    "- 🔴 緊急（在庫切れ＋売れ筋）\n"
+                    "- 🟡 要注意（在庫残少＋売れ筋）\n"
+                    "- 🟢 通常補充\n"
+                    "日本語で回答してください。"
+                ),
+                messages=[{"role": "user", "content": data_text}],
+            ),
+            timeout=45,
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        logger.error(f"UTAK reorder AI failed: {e}")
+        return f"AI分析エラー: {e}"
 
 def parse_weekday(text: str) -> int:
     t = text.lower().strip()
@@ -1142,6 +1427,9 @@ async def generate_procurement_recommendation(chat_id: int, budget: float) -> st
         loop.run_in_executor(None, get_order_history_summary, chat_id, 3),
     )
     fixed_items = get_fixed_items(chat_id)
+    # UTAK在庫データも取得
+    utak_low = get_utak_low_stock(chat_id, threshold=5)
+    utak_out = get_utak_out_of_stock(chat_id)
     search_text = ""
     if search_results:
         for cat in ["日本スーパー", "ドンキホーテ", "SNSバズ", "フィリピン人気"]:
@@ -1186,10 +1474,25 @@ async def generate_procurement_recommendation(chat_id: int, budget: float) -> st
         + ("- 固定アイテムは必ずいずれかのカテゴリに含め、指定の最低数量を守ってください\n" if fixed_items else "")
         + "- JSON以外のテキストは一切含めないでください"
     )
+    # UTAK在庫状況テキスト
+    utak_text = ""
+    if utak_out:
+        utak_text += "【UTAK POS: 在庫切れ商品（優先仕入れ）】\n"
+        for it in utak_out[:15]:
+            opt = f" ({it['option']})" if it.get('option') else ""
+            utak_text += f"- {it['item_name']}{opt}（{it['category']}）\n"
+        utak_text += "\n"
+    if utak_low:
+        utak_text += "【UTAK POS: 在庫残少商品（5個以下）】\n"
+        for it in utak_low[:15]:
+            opt = f" ({it['option']})" if it.get('option') else ""
+            utak_text += f"- {it['item_name']}{opt}（{it['category']}）: 残{it['ending']:.0f}個\n"
+        utak_text += "\n"
     user_msg = (
         f"【店舗売上データ（過去30日）】\n{sales_summary}\n\n"
         + (f"【過去の注文履歴】\n{order_history_text}\n\n" if order_history_text and order_history_text != "注文履歴なし" else "")
         + (f"{fixed_items_text}\n" if fixed_items_text else "")
+        + (utak_text if utak_text else "")
         + f"【日本のトレンド商品情報（ウェブ検索結果）】\n{search_text}\n\n"
         f"上記を踏まえ、今週の仕入れ提案を ¥{budget:,.0f} の予算内でJSON形式で作成してください。"
     )
@@ -2676,6 +2979,13 @@ def detect_intent(text: str) -> Optional[str]:
     # Order history CSV
     if any(k in t for k in ['注文履歴', '注文csv', '注文 csv', 'order history', 'order csv']):
         return 'order_history_csv'
+    # UTAK intents
+    if any(k in t for k in ['在庫分析', 'utak分析', '仕入れ分析', 'reorder', '発注分析']):
+        return 'utak_analysis'
+    if any(k in t for k in ['utak在庫', 'utak stock', '在庫サマリー', 'pos在庫']):
+        return 'utak_stock'
+    if any(k in t for k in ['売れ筋', 'bestseller', 'ベストセラー', '売上ランキング', '人気商品']):
+        return 'utak_bestsellers'
     return None
 
 def is_bot_mentioned(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -2718,7 +3028,12 @@ HELP_TEXT = """🤖 話しかけてくれてありがとう！
 
 📦 「在庫確認」— 現在の在庫一覧
 📦 「在庫更新 カップ麺 -10」— 在庫を手動で更新
-📋 「注文履歴」— 過去90日の注文CSVを取得"""
+📋 「注文履歴」— 過去90日の注文CSVを取得
+
+📤 UTAKのCSVファイルを送信 — 在庫・売上を自動取り込み
+📊 「売れ筋」— UTAK売上ランキング
+📦 「UTAK在庫」— 在庫サマリー表示
+🔍 「在庫分析」— AI仕入れ提案"""
 
 # ─── Main message handler ──────────────────────────────────
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2931,6 +3246,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == 'inventory_check':          await cmd_inventory(update, ctx)
     elif intent == 'inventory_update':         await cmd_update_inventory(update, ctx, text)
     elif intent == 'order_history_csv':        await cmd_order_history_csv(update, ctx)
+    elif intent == 'utak_analysis':           await cmd_utak_analysis(update, ctx)
+    elif intent == 'utak_stock':              await cmd_utak_stock(update, ctx)
+    elif intent == 'utak_bestsellers':        await cmd_utak_bestsellers(update, ctx)
     else:
         try:
             reply_text = await ai_chat(text)
@@ -3323,6 +3641,100 @@ async def cmd_view_procurement_settings(update: Update, ctx: ContextTypes.DEFAUL
     )
     save_bot_message(chat_id, sent.message_id)
 
+# ─── UTAK CSV upload & analysis handlers ──────────────────
+async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """CSVファイルがアップロードされたら自動でUTAKデータとして取り込む。"""
+    doc = update.message.document
+    if not doc or not doc.file_name:
+        return
+    fname = doc.file_name.lower()
+    if not fname.endswith('.csv'):
+        return
+    chat_id = update.effective_chat.id
+    # Download file
+    file = await ctx.bot.get_file(doc.file_id)
+    buf = io.BytesIO()
+    await file.download_to_memory(buf)
+    buf.seek(0)
+    # Detect encoding (BOM)
+    raw = buf.read()
+    text = raw.decode('utf-8-sig')
+    reader = csv.DictReader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        sent = await update.message.reply_text("⚠️ CSVファイルにデータがありません。")
+        save_bot_message(chat_id, sent.message_id)
+        return
+    csv_type = detect_utak_csv_type(list(rows[0].keys()))
+    if csv_type == 'inventory':
+        count = import_utak_inventory_csv(chat_id, rows)
+        summary = get_utak_inventory_summary(chat_id)
+        low = get_utak_low_stock(chat_id, threshold=5)
+        out = get_utak_out_of_stock(chat_id)
+        msg_lines = [f"✅ UTAK在庫データ取り込み完了（{count}品目）\n"]
+        msg_lines.append(summary)
+        if out:
+            msg_lines.append(f"\n🔴 在庫切れ（売れ筋）: {len(out)}品")
+            for it in out[:10]:
+                opt = f" ({it['option']})" if it.get('option') else ""
+                msg_lines.append(f"  • {it['item_name']}{opt}")
+            if len(out) > 10:
+                msg_lines.append(f"  ...他{len(out)-10}品")
+        if low:
+            msg_lines.append(f"\n🟡 在庫残少（5個以下）: {len(low)}品")
+            for it in low[:10]:
+                opt = f" ({it['option']})" if it.get('option') else ""
+                msg_lines.append(f"  • {it['item_name']}{opt}: 残{it['ending']:.0f}個")
+            if len(low) > 10:
+                msg_lines.append(f"  ...他{len(low)-10}品")
+        msg_lines.append("\n💡「在庫分析」で仕入れ提案を生成できます")
+        sent = await update.message.reply_text("\n".join(msg_lines))
+        save_bot_message(chat_id, sent.message_id)
+    elif csv_type == 'transactions':
+        count = import_utak_sales_csv(chat_id, rows)
+        # Quick summary
+        top = get_utak_sales_top(chat_id, days=1, limit=10)
+        msg_lines = [f"✅ UTAK売上データ取り込み完了（{count}件）\n"]
+        if top:
+            msg_lines.append("📊 本日の売れ筋トップ10:")
+            for i, it in enumerate(top, 1):
+                msg_lines.append(f"  {i}. {it['item_name']}（{it['category']}）: {it['total_qty']:.0f}個 / ₱{it['total_sales']:,.0f}")
+        msg_lines.append("\n💡「在庫分析」で仕入れ提案を生成できます")
+        sent = await update.message.reply_text("\n".join(msg_lines))
+        save_bot_message(chat_id, sent.message_id)
+    else:
+        sent = await update.message.reply_text("⚠️ UTAKのCSV形式を認識できませんでした。\nInventory CSV または Transactions Details CSV をお送りください。")
+        save_bot_message(chat_id, sent.message_id)
+
+async def cmd_utak_analysis(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """UTAK在庫+売上データをAI分析して仕入れ提案を生成。"""
+    chat_id = update.effective_chat.id
+    sent = await update.message.reply_text("🔄 UTAKデータを分析中...")
+    save_bot_message(chat_id, sent.message_id)
+    result = await generate_utak_reorder_ai(chat_id)
+    await sent.edit_text(result)
+
+async def cmd_utak_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """UTAKの在庫サマリーを表示。"""
+    chat_id = update.effective_chat.id
+    summary = get_utak_inventory_summary(chat_id)
+    sent = await update.message.reply_text(summary)
+    save_bot_message(chat_id, sent.message_id)
+
+async def cmd_utak_bestsellers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """UTAK売上データから売れ筋ランキングを表示。"""
+    chat_id = update.effective_chat.id
+    top = get_utak_sales_top(chat_id, days=7, limit=20)
+    if not top:
+        sent = await update.message.reply_text("📊 売上データがありません。UTAKのTransactions CSVを送ってください。")
+        save_bot_message(chat_id, sent.message_id)
+        return
+    lines = ["📊 過去7日の売れ筋トップ20\n━━━━━━━━━━━━━━━━━━━"]
+    for i, it in enumerate(top, 1):
+        lines.append(f"{i}. {it['item_name']}（{it['category']}）\n   {it['total_qty']:.0f}個 / ₱{it['total_sales']:,.0f}")
+    sent = await update.message.reply_text("\n".join(lines))
+    save_bot_message(chat_id, sent.message_id)
+
 # ─── Main ──────────────────────────────────────────────────
 def main():
     init_db()
@@ -3344,6 +3756,7 @@ def main():
     app.add_handler(TypeHandler(Update, _log_raw_update), group=-1)
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(handle_procurement_callback, pattern=r'^proc_'))
 
     # Schedule auto weekly report every Monday 8:00 AM PHT (UTC+8 = UTC 0:00)
