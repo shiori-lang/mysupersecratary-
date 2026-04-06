@@ -3912,38 +3912,39 @@ async def auto_reorder_job(context):
     if not reorder:
         await context.bot.send_message(chat_id=chat_id, text="📋 仕入れリスト自動生成: UTAKデータが不足しています。")
         return
-    # Build message
+    # Build message (English for manager)
     now = datetime.now(PHT)
     tomorrow = now + timedelta(days=1)
     week_num = (tomorrow.day - 1) // 7 + 1
-    lines = [f"📋 仕入れリスト（第{week_num}水曜 {tomorrow.strftime('%m/%d')} 用）\n━━━━━━━━━━━━━━━━━━━"]
+    ordinal = {1: '1st', 2: '2nd', 3: '3rd'}.get(week_num, f'{week_num}th')
+    lines = [f"📋 Reorder List for {ordinal} Wednesday {tomorrow.strftime('%m/%d')}\n━━━━━━━━━━━━━━━━━━━"]
     urgent = [r for r in reorder if r['priority'] == '🔴']
     warning = [r for r in reorder if r['priority'] == '🟡']
     normal = [r for r in reorder if r['priority'] == '🟢']
     if urgent:
-        lines.append(f"\n🔴 緊急（在庫切れ間近）: {len(urgent)}品")
+        lines.append(f"\n🔴 URGENT (out of stock soon): {len(urgent)} items")
         for it in urgent[:20]:
-            stock_str = f"残{it['stock']:.0f}" if it['stock'] > 0 else "在庫切れ"
-            lines.append(f"  • {it['item_name']}（{it['category']}）")
-            lines.append(f"    {stock_str} | {it['daily_rate']:.1f}個/日 | あと{it['days_left']:.0f}日")
+            stock_str = f"{it['stock']:.0f} left" if it['stock'] > 0 else "OUT OF STOCK"
+            lines.append(f"  • {it['item_name']} ({it['category']})")
+            lines.append(f"    {stock_str} | {it['daily_rate']:.1f}/day | {it['days_left']:.0f} days left")
     if warning:
-        lines.append(f"\n🟡 要注意（7日以内に切れる）: {len(warning)}品")
+        lines.append(f"\n🟡 WARNING (runs out within 7 days): {len(warning)} items")
         for it in warning[:20]:
-            lines.append(f"  • {it['item_name']}（{it['category']}）")
-            lines.append(f"    残{it['stock']:.0f} | {it['daily_rate']:.1f}個/日 | あと{it['days_left']:.0f}日")
+            lines.append(f"  • {it['item_name']} ({it['category']})")
+            lines.append(f"    {it['stock']:.0f} left | {it['daily_rate']:.1f}/day | {it['days_left']:.0f} days left")
     if normal:
-        lines.append(f"\n🟢 通常補充: {len(normal)}品")
+        lines.append(f"\n🟢 Regular restock: {len(normal)} items")
         for it in normal[:15]:
-            lines.append(f"  • {it['item_name']}: 残{it['stock']:.0f} | {it['daily_rate']:.1f}個/日")
+            lines.append(f"  • {it['item_name']}: {it['stock']:.0f} left | {it['daily_rate']:.1f}/day")
         if len(normal) > 15:
-            lines.append(f"  ...他{len(normal)-15}品（CSVに含まれます）")
-    lines.append(f"\n合計: 🔴{len(urgent)} + 🟡{len(warning)} + 🟢{len(normal)} = {len(reorder)}品")
+            lines.append(f"  ...and {len(normal)-15} more (see CSV)")
+    lines.append(f"\nTotal: 🔴{len(urgent)} + 🟡{len(warning)} + 🟢{len(normal)} = {len(reorder)} items")
     await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
-    # CSV送信
+    # CSV (English headers)
     csv_buf = io.StringIO()
     csv_buf.write('\ufeff')
     writer = csv.writer(csv_buf)
-    writer.writerow(['優先度', 'カテゴリ', '商品名', '現在庫', '日販数', 'あと何日', '14日売上合計'])
+    writer.writerow(['Priority', 'Category', 'Item', 'Current Stock', 'Daily Sales', 'Days Left', '14-Day Total Sales'])
     for it in reorder:
         writer.writerow([it['priority'], it['category'], it['item_name'],
                          f"{it['stock']:.0f}", f"{it['daily_rate']:.1f}",
@@ -3955,7 +3956,7 @@ async def auto_reorder_job(context):
         chat_id=chat_id,
         document=io.BytesIO(csv_bytes),
         filename=f"reorder_{date_str}.csv",
-        caption=f"📋 仕入れリストCSV（{tomorrow.strftime('%m/%d')} 水曜用）"
+        caption=f"📋 Reorder List CSV ({ordinal} Wed {tomorrow.strftime('%m/%d')})"
     )
     logger.info(f"Auto reorder sent: {len(reorder)} items")
 
