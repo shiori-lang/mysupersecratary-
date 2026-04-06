@@ -3897,11 +3897,13 @@ def _is_tuesday_before_1st_or_3rd_wednesday() -> bool:
     week_num = (wednesday.day - 1) // 7 + 1
     return week_num in (1, 3)
 
+REORDER_CHAT_ID = -4845840580
+
 async def auto_reorder_job(context):
     """第1・第3水曜の前日火曜に自動仕入れリストを生成・送信。"""
     if not _is_tuesday_before_1st_or_3rd_wednesday():
         return
-    chat_id = OWNER_CHAT_ID or WEEKLY_REPORT_CHAT_ID
+    chat_id = REORDER_CHAT_ID
     if not chat_id:
         return
     logger.info("Auto reorder: generating procurement list...")
