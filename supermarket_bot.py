@@ -3870,14 +3870,14 @@ def main():
             name='auto_procurement',
         )
         logger.info("Procurement auto-recommendation scheduled: daily 20:00 PHT check")
-        # UTAK auto-sync: daily 22:00 PHT (after store closes)
+        # UTAK auto-sync: daily 01:00 PHT (after midnight close)
         if UTAK_EMAIL and UTAK_PASSWORD:
             app.job_queue.run_daily(
                 utak_auto_sync,
-                time=dtime(22, 0, tzinfo=PHT),
+                time=dtime(1, 0, tzinfo=PHT),
                 name='utak_auto_sync',
             )
-            logger.info("UTAK auto-sync scheduled: daily 22:00 PHT")
+            logger.info("UTAK auto-sync scheduled: daily 01:00 PHT")
         else:
             logger.info("UTAK credentials not set — auto-sync disabled")
     elif not WEEKLY_REPORT_CHAT_ID:
