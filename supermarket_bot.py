@@ -85,6 +85,10 @@ PHT = timezone(timedelta(hours=8))
 # Brave Search API for procurement recommendations
 BRAVE_SEARCH_API_KEY = os.environ.get('BRAVE_SEARCH_API_KEY', '')
 
+# UTAK POS credentials for auto-sync
+UTAK_EMAIL    = os.environ.get('UTAK_EMAIL', '')
+UTAK_PASSWORD = os.environ.get('UTAK_PASSWORD', '')
+
 # DB directory auto-create
 pathlib.Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
@@ -3735,6 +3739,85 @@ async def cmd_utak_bestsellers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sent = await update.message.reply_text("\n".join(lines))
     save_bot_message(chat_id, sent.message_id)
 
+# ─── UTAK auto-sync job ───────────────────────────────────
+async def utak_auto_sync(context):
+    """毎日自動でUTAKからCSVをダウンロードし、DBに取り込む。"""
+    if not UTAK_EMAIL or not UTAK_PASSWORD:
+        logger.info("UTAK credentials not set — skipping auto-sync")
+        return
+    chat_id = OWNER_CHAT_ID or WEEKLY_REPORT_CHAT_ID
+    if not chat_id:
+        logger.warning("No chat_id for UTAK sync notification")
+        return
+    logger.info("UTAK auto-sync starting...")
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            ctx = await browser.new_context(accept_downloads=True)
+            page = await ctx.new_page()
+            # Login
+            await page.goto('https://utak.io/login', timeout=30000)
+            await asyncio.sleep(3)
+            await page.fill('input[type=text]', UTAK_EMAIL)
+            await page.fill('input[type=password]', UTAK_PASSWORD)
+            await page.click('button:has-text("Log in")')
+            await asyncio.sleep(8)
+            results = []
+            # Download Inventory CSV
+            try:
+                await page.click('a[href="/inventory"]')
+                await asyncio.sleep(6)
+                async with page.expect_download(timeout=30000) as dl_info:
+                    await page.click('button:has-text("Download")')
+                download = await dl_info.value
+                inv_path = '/tmp/utak_inventory_auto.csv'
+                await download.save_as(inv_path)
+                with open(inv_path, 'r', encoding='utf-8-sig') as f:
+                    reader = csv.DictReader(f)
+                    rows = list(reader)
+                inv_count = import_utak_inventory_csv(chat_id, rows)
+                results.append(f"📦 在庫: {inv_count}品目")
+                logger.info(f"UTAK inventory sync: {inv_count} items")
+            except Exception as e:
+                results.append(f"❌ 在庫取得失敗: {e}")
+                logger.error(f"UTAK inventory sync failed: {e}")
+            # Download Transactions CSV
+            try:
+                await page.click('a[href="/transactions"]')
+                await asyncio.sleep(6)
+                async with page.expect_download(timeout=30000) as dl_info:
+                    await page.click('button:has-text("Download")')
+                download = await dl_info.value
+                txn_path = '/tmp/utak_transactions_auto.csv'
+                await download.save_as(txn_path)
+                with open(txn_path, 'r', encoding='utf-8-sig') as f:
+                    reader = csv.DictReader(f)
+                    rows = list(reader)
+                txn_count = import_utak_sales_csv(chat_id, rows)
+                results.append(f"💰 売上: {txn_count}件")
+                logger.info(f"UTAK sales sync: {txn_count} items")
+            except Exception as e:
+                results.append(f"❌ 売上取得失敗: {e}")
+                logger.error(f"UTAK sales sync failed: {e}")
+            await browser.close()
+        # Notify
+        now = datetime.now(PHT).strftime('%Y-%m-%d %H:%M')
+        summary = get_utak_inventory_summary(chat_id)
+        low = get_utak_low_stock(chat_id, threshold=5)
+        msg = f"🔄 UTAK自動同期完了（{now}）\n" + "\n".join(results)
+        if low:
+            msg += f"\n\n🟡 在庫残少: {len(low)}品"
+            for it in low[:5]:
+                msg += f"\n  • {it['item_name']}: 残{it['ending']:.0f}個"
+        await context.bot.send_message(chat_id=chat_id, text=msg)
+    except Exception as e:
+        logger.error(f"UTAK auto-sync failed: {e}")
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ UTAK自動同期エラー: {e}")
+        except Exception:
+            pass
+
 # ─── Main ──────────────────────────────────────────────────
 def main():
     init_db()
@@ -3787,6 +3870,16 @@ def main():
             name='auto_procurement',
         )
         logger.info("Procurement auto-recommendation scheduled: daily 20:00 PHT check")
+        # UTAK auto-sync: daily 22:00 PHT (after store closes)
+        if UTAK_EMAIL and UTAK_PASSWORD:
+            app.job_queue.run_daily(
+                utak_auto_sync,
+                time=dtime(22, 0, tzinfo=PHT),
+                name='utak_auto_sync',
+            )
+            logger.info("UTAK auto-sync scheduled: daily 22:00 PHT")
+        else:
+            logger.info("UTAK credentials not set — auto-sync disabled")
     elif not WEEKLY_REPORT_CHAT_ID:
         logger.info("WEEKLY_REPORT_CHAT_ID not set — auto weekly report disabled")
 
