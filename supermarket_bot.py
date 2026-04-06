@@ -800,6 +800,75 @@ def get_utak_inventory_summary(chat_id: int) -> str:
     lines.append(f"\n合計: {total_items}品在庫 | 🔴{total_out}品切 | 🟡{total_low}残少 | ₱{total_val:,.0f}")
     return "\n".join(lines)
 
+def get_utak_reorder_list(chat_id: int) -> list[dict]:
+    """在庫 × 売上速度で仕入れ優先度リストを生成。各商品に days_until_stockout を計算。"""
+    conn = get_conn()
+    c = conn.cursor()
+    # 最新在庫
+    c.execute('SELECT MAX(imported_at) FROM utak_inventory WHERE chat_id=?', (chat_id,))
+    row = c.fetchone()
+    if not row or not row[0]:
+        conn.close()
+        return []
+    latest = row[0]
+    c.execute('''SELECT category, item_name, option, ending, inv_value
+                 FROM utak_inventory WHERE chat_id=? AND imported_at=?''',
+              (chat_id, latest))
+    inv_map = {}
+    for r in c.fetchall():
+        key = (r[0], r[1])
+        inv_map[key] = {'category': r[0], 'item_name': r[1], 'option': r[2],
+                        'stock': r[3], 'inv_value': r[4]}
+    # 過去14日の売上速度（1日あたり）
+    since = (datetime.now(PHT) - timedelta(days=14)).strftime('%Y-%m-%d')
+    c.execute('''SELECT category, item_name, SUM(qty) as total_qty, COUNT(DISTINCT sale_date) as days_sold
+                 FROM utak_sales WHERE chat_id=? AND sale_date>=?
+                 GROUP BY category, item_name''', (chat_id, since))
+    sales_map = {}
+    for r in c.fetchall():
+        key = (r[0], r[1])
+        total_qty = r[2]
+        daily_rate = total_qty / 14.0
+        sales_map[key] = {'total_qty': total_qty, 'daily_rate': daily_rate, 'days_sold': r[3]}
+    conn.close()
+    # Merge and calculate
+    results = []
+    for key, inv in inv_map.items():
+        sale = sales_map.get(key, {'total_qty': 0, 'daily_rate': 0, 'days_sold': 0})
+        stock = inv['stock']
+        daily_rate = sale['daily_rate']
+        if daily_rate > 0 and stock > 0:
+            days_left = stock / daily_rate
+        elif daily_rate > 0 and stock <= 0:
+            days_left = 0  # already out
+        else:
+            days_left = 999  # not selling, no urgency
+        # Priority: 🔴 urgent (<=2 days), 🟡 warning (<=7 days), 🟢 normal
+        if days_left <= 2:
+            priority = '🔴'
+            priority_score = 0
+        elif days_left <= 7:
+            priority = '🟡'
+            priority_score = 1
+        elif stock <= 0 and sale['total_qty'] > 0:
+            priority = '🔴'
+            priority_score = 0
+        else:
+            priority = '🟢'
+            priority_score = 2
+        # Only include items that are actually selling and need reorder
+        if sale['total_qty'] > 0 and (stock <= 0 or days_left <= 14):
+            results.append({
+                **inv,
+                'total_sold_14d': sale['total_qty'],
+                'daily_rate': daily_rate,
+                'days_left': days_left,
+                'priority': priority,
+                'priority_score': priority_score,
+            })
+    results.sort(key=lambda x: (x['priority_score'], x['days_left']))
+    return results
+
 async def generate_utak_reorder_ai(chat_id: int) -> str:
     """UTAK在庫+売上データからAIで仕入れ提案を生成。"""
     loop = asyncio.get_event_loop()
@@ -3818,6 +3887,78 @@ async def utak_auto_sync(context):
         except Exception:
             pass
 
+def _is_tuesday_before_1st_or_3rd_wednesday() -> bool:
+    """今日が第1水曜または第3水曜の前日（火曜）かどうか判定。"""
+    today = datetime.now(PHT).date()
+    if today.weekday() != 1:  # 1 = Tuesday
+        return False
+    wednesday = today + timedelta(days=1)
+    # 第何週の水曜日か: (day-1)//7 + 1
+    week_num = (wednesday.day - 1) // 7 + 1
+    return week_num in (1, 3)
+
+async def auto_reorder_job(context):
+    """第1・第3水曜の前日火曜に自動仕入れリストを生成・送信。"""
+    if not _is_tuesday_before_1st_or_3rd_wednesday():
+        return
+    chat_id = OWNER_CHAT_ID or WEEKLY_REPORT_CHAT_ID
+    if not chat_id:
+        return
+    logger.info("Auto reorder: generating procurement list...")
+    # まずUTAKデータを最新に同期（もしcredentialがあれば）
+    if UTAK_EMAIL and UTAK_PASSWORD:
+        await utak_auto_sync(context)
+    reorder = get_utak_reorder_list(chat_id)
+    if not reorder:
+        await context.bot.send_message(chat_id=chat_id, text="📋 仕入れリスト自動生成: UTAKデータが不足しています。")
+        return
+    # Build message
+    now = datetime.now(PHT)
+    tomorrow = now + timedelta(days=1)
+    week_num = (tomorrow.day - 1) // 7 + 1
+    lines = [f"📋 仕入れリスト（第{week_num}水曜 {tomorrow.strftime('%m/%d')} 用）\n━━━━━━━━━━━━━━━━━━━"]
+    urgent = [r for r in reorder if r['priority'] == '🔴']
+    warning = [r for r in reorder if r['priority'] == '🟡']
+    normal = [r for r in reorder if r['priority'] == '🟢']
+    if urgent:
+        lines.append(f"\n🔴 緊急（在庫切れ間近）: {len(urgent)}品")
+        for it in urgent[:20]:
+            stock_str = f"残{it['stock']:.0f}" if it['stock'] > 0 else "在庫切れ"
+            lines.append(f"  • {it['item_name']}（{it['category']}）")
+            lines.append(f"    {stock_str} | {it['daily_rate']:.1f}個/日 | あと{it['days_left']:.0f}日")
+    if warning:
+        lines.append(f"\n🟡 要注意（7日以内に切れる）: {len(warning)}品")
+        for it in warning[:20]:
+            lines.append(f"  • {it['item_name']}（{it['category']}）")
+            lines.append(f"    残{it['stock']:.0f} | {it['daily_rate']:.1f}個/日 | あと{it['days_left']:.0f}日")
+    if normal:
+        lines.append(f"\n🟢 通常補充: {len(normal)}品")
+        for it in normal[:15]:
+            lines.append(f"  • {it['item_name']}: 残{it['stock']:.0f} | {it['daily_rate']:.1f}個/日")
+        if len(normal) > 15:
+            lines.append(f"  ...他{len(normal)-15}品（CSVに含まれます）")
+    lines.append(f"\n合計: 🔴{len(urgent)} + 🟡{len(warning)} + 🟢{len(normal)} = {len(reorder)}品")
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    # CSV送信
+    csv_buf = io.StringIO()
+    csv_buf.write('\ufeff')
+    writer = csv.writer(csv_buf)
+    writer.writerow(['優先度', 'カテゴリ', '商品名', '現在庫', '日販数', 'あと何日', '14日売上合計'])
+    for it in reorder:
+        writer.writerow([it['priority'], it['category'], it['item_name'],
+                         f"{it['stock']:.0f}", f"{it['daily_rate']:.1f}",
+                         f"{it['days_left']:.0f}" if it['days_left'] < 999 else '-',
+                         f"{it['total_sold_14d']:.0f}"])
+    csv_bytes = csv_buf.getvalue().encode('utf-8-sig')
+    date_str = tomorrow.strftime('%Y%m%d')
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=io.BytesIO(csv_bytes),
+        filename=f"reorder_{date_str}.csv",
+        caption=f"📋 仕入れリストCSV（{tomorrow.strftime('%m/%d')} 水曜用）"
+    )
+    logger.info(f"Auto reorder sent: {len(reorder)} items")
+
 # ─── Main ──────────────────────────────────────────────────
 def main():
     init_db()
@@ -3880,6 +4021,13 @@ def main():
             logger.info("UTAK auto-sync scheduled: daily 01:00 PHT")
         else:
             logger.info("UTAK credentials not set — auto-sync disabled")
+        # Auto reorder list: daily 20:00 PHT check (fires only on Tuesdays before 1st/3rd Wednesday)
+        app.job_queue.run_daily(
+            auto_reorder_job,
+            time=dtime(20, 0, tzinfo=PHT),
+            name='auto_reorder',
+        )
+        logger.info("Auto reorder scheduled: Tue 20:00 PHT before 1st/3rd Wed")
     elif not WEEKLY_REPORT_CHAT_ID:
         logger.info("WEEKLY_REPORT_CHAT_ID not set — auto weekly report disabled")
 
