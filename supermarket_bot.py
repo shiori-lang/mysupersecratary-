@@ -4051,7 +4051,7 @@ async def utak_auto_sync(context):
     if not UTAK_EMAIL or not UTAK_PASSWORD:
         logger.info("UTAK credentials not set — skipping auto-sync")
         return
-    chat_id = OWNER_CHAT_ID or WEEKLY_REPORT_CHAT_ID
+    chat_id = REORDER_CHAT_ID or WEEKLY_REPORT_CHAT_ID
     if not chat_id:
         logger.warning("No chat_id for UTAK sync notification")
         return
@@ -4069,11 +4069,34 @@ async def utak_auto_sync(context):
             await page.fill('input[type=password]', UTAK_PASSWORD)
             await page.click('button:has-text("Log in")')
             await asyncio.sleep(8)
+            # Close any modal/dialog that may appear after login
+            for _ in range(3):
+                try:
+                    dialog = page.locator('.MuiDialog-root')
+                    if await dialog.count() > 0:
+                        await page.keyboard.press('Escape')
+                        await asyncio.sleep(1)
+                except Exception:
+                    break
             results = []
+            async def _dismiss_modals():
+                """Close any MUI dialog/modal that blocks clicks."""
+                for _ in range(5):
+                    try:
+                        if await page.locator('.MuiDialog-root').count() > 0:
+                            await page.keyboard.press('Escape')
+                            await asyncio.sleep(1)
+                        else:
+                            break
+                    except Exception:
+                        break
+
             # Download Inventory CSV
             try:
+                await _dismiss_modals()
                 await page.click('a[href="/inventory"]')
                 await asyncio.sleep(6)
+                await _dismiss_modals()
                 async with page.expect_download(timeout=30000) as dl_info:
                     await page.click('button:has-text("Download")')
                 download = await dl_info.value
@@ -4090,8 +4113,10 @@ async def utak_auto_sync(context):
                 logger.error(f"UTAK inventory sync failed: {e}")
             # Download Transactions CSV
             try:
+                await _dismiss_modals()
                 await page.click('a[href="/transactions"]')
                 await asyncio.sleep(6)
+                await _dismiss_modals()
                 async with page.expect_download(timeout=30000) as dl_info:
                     await page.click('button:has-text("Download")')
                 download = await dl_info.value
