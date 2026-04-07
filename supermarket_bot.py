@@ -310,7 +310,6 @@ def parse_manpower_schedule(text: str) -> dict:
     for shift_key, patterns in [
         ('graveyard', [
             r'graveyard[\s\S]{0,300}?(?:OIC|Team Lead|Manager)[^:\n]*:\s*([A-Za-z ]+)',
-            r'(?:OIC|Team Lead)[^:\n]*:\s*([A-Za-z ]+)',
         ]),
         ('morning', [
             r'morning[\s\S]{0,300}?(?:OIC|Team Lead|Manager)[^:\n]*:\s*([A-Za-z ]+)',
