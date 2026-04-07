@@ -800,6 +800,139 @@ def get_utak_inventory_summary(chat_id: int) -> str:
     lines.append(f"\n合計: {total_items}品在庫 | 🔴{total_out}品切 | 🟡{total_low}残少 | ₱{total_val:,.0f}")
     return "\n".join(lines)
 
+def get_dead_stock(chat_id: int, days: int = 14) -> list[dict]:
+    """在庫あり（ending > 0）だが過去N日間売れていない商品を検出。"""
+    since = (datetime.now(PHT) - timedelta(days=days)).strftime('%Y-%m-%d')
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT MAX(imported_at) FROM utak_inventory WHERE chat_id=?', (chat_id,))
+    row = c.fetchone()
+    if not row or not row[0]:
+        conn.close()
+        return []
+    latest = row[0]
+    # 在庫ある商品
+    c.execute('''SELECT category, item_name, option, ending, inv_value
+                 FROM utak_inventory WHERE chat_id=? AND imported_at=? AND ending > 0''',
+              (chat_id, latest))
+    in_stock = {(r[0], r[1]): {'category': r[0], 'item_name': r[1], 'option': r[2],
+                                'stock': r[3], 'inv_value': r[4]} for r in c.fetchall()}
+    # 過去N日に売れた商品
+    c.execute('''SELECT DISTINCT category, item_name FROM utak_sales
+                 WHERE chat_id=? AND sale_date>=?''', (chat_id, since))
+    sold = {(r[0], r[1]) for r in c.fetchall()}
+    conn.close()
+    dead = [v for k, v in in_stock.items() if k not in sold]
+    dead.sort(key=lambda x: x.get('inv_value', 0) or 0, reverse=True)
+    return dead
+
+def get_online_vs_store_sales(chat_id: int, days: int = 7) -> dict:
+    """GrabMart/GrabFood/FoodPanda vs 店舗売上を比較。"""
+    since = (datetime.now(PHT) - timedelta(days=days)).strftime('%Y-%m-%d')
+    conn = get_conn()
+    c = conn.cursor()
+    online_cats = ('GRABMART', 'GRABFOOD', 'FOODPANDA')
+    c.execute(f'''SELECT category, SUM(qty) as total_qty, SUM(gross_price) as total_sales, COUNT(*) as txn_count
+                 FROM utak_sales WHERE chat_id=? AND sale_date>=?
+                 GROUP BY category''', (chat_id, since))
+    rows = c.fetchall()
+    conn.close()
+    online = {'qty': 0, 'sales': 0, 'txn': 0, 'by_platform': {}}
+    store = {'qty': 0, 'sales': 0, 'txn': 0}
+    for cat, qty, sales, txn in rows:
+        cat_upper = cat.upper().strip()
+        # Check if category name starts with an online platform
+        is_online = any(cat_upper.startswith(p) or cat_upper == p for p in online_cats)
+        if is_online:
+            platform = cat_upper.split()[0] if ' ' in cat_upper else cat_upper
+            online['qty'] += qty or 0
+            online['sales'] += sales or 0
+            online['txn'] += txn or 0
+            if platform not in online['by_platform']:
+                online['by_platform'][platform] = {'qty': 0, 'sales': 0}
+            online['by_platform'][platform]['qty'] += qty or 0
+            online['by_platform'][platform]['sales'] += sales or 0
+        else:
+            store['qty'] += qty or 0
+            store['sales'] += sales or 0
+            store['txn'] += txn or 0
+    return {'online': online, 'store': store, 'days': days}
+
+def get_hourly_sales(chat_id: int, days: int = 7) -> list[dict]:
+    """時間帯別の売上集計。"""
+    since = (datetime.now(PHT) - timedelta(days=days)).strftime('%Y-%m-%d')
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''SELECT sale_time, category, item_name, SUM(qty) as total_qty, SUM(gross_price) as total_sales
+                 FROM utak_sales WHERE chat_id=? AND sale_date>=? AND sale_time != ''
+                 GROUP BY sale_time, category, item_name
+                 ORDER BY total_qty DESC''', (chat_id, since))
+    raw = c.fetchall()
+    conn.close()
+    # Parse time into hour buckets
+    import re as _re
+    hourly = {}  # hour -> {sales, qty, top_items}
+    for time_str, cat, item, qty, sales in raw:
+        # Parse "9:11am", "12:28pm" etc
+        m = _re.match(r'(\d{1,2}):(\d{2})\s*(am|pm)', time_str.strip().lower())
+        if not m:
+            continue
+        h = int(m.group(1))
+        ampm = m.group(3)
+        if ampm == 'pm' and h != 12:
+            h += 12
+        elif ampm == 'am' and h == 12:
+            h = 0
+        if h not in hourly:
+            hourly[h] = {'hour': h, 'sales': 0, 'qty': 0, 'items': {}}
+        hourly[h]['sales'] += sales or 0
+        hourly[h]['qty'] += qty or 0
+        key = item
+        hourly[h]['items'][key] = hourly[h]['items'].get(key, 0) + (qty or 0)
+    # Convert to list with top items
+    result = []
+    for h in sorted(hourly.keys()):
+        data = hourly[h]
+        top = sorted(data['items'].items(), key=lambda x: x[1], reverse=True)[:3]
+        result.append({
+            'hour': h,
+            'label': f"{h}:00" if h >= 10 else f" {h}:00",
+            'sales': data['sales'],
+            'qty': data['qty'],
+            'top_items': top,
+        })
+    return result
+
+def get_frequently_bought_together(chat_id: int, days: int = 14, min_count: int = 3) -> list[dict]:
+    """同じトランザクションで一緒に買われた商品ペアを検出。"""
+    since = (datetime.now(PHT) - timedelta(days=days)).strftime('%Y-%m-%d')
+    conn = get_conn()
+    c = conn.cursor()
+    # Get items per transaction
+    c.execute('''SELECT transaction_id, item_name FROM utak_sales
+                 WHERE chat_id=? AND sale_date>=? AND transaction_id != ''
+                 ORDER BY transaction_id''', (chat_id, since))
+    txn_items: dict[str, list[str]] = {}
+    for txn_id, item in c.fetchall():
+        txn_items.setdefault(txn_id, []).append(item)
+    conn.close()
+    # Count pairs
+    from collections import Counter
+    pair_count = Counter()
+    for txn_id, items in txn_items.items():
+        unique = list(set(items))
+        if len(unique) < 2:
+            continue
+        for i in range(len(unique)):
+            for j in range(i + 1, len(unique)):
+                pair = tuple(sorted([unique[i], unique[j]]))
+                pair_count[pair] += 1
+    results = []
+    for (a, b), count in pair_count.most_common(20):
+        if count >= min_count:
+            results.append({'item_a': a, 'item_b': b, 'count': count})
+    return results
+
 def get_utak_reorder_list(chat_id: int) -> list[dict]:
     """在庫 × 売上速度で仕入れ優先度リストを生成。各商品に days_until_stockout を計算。"""
     conn = get_conn()
@@ -3059,6 +3192,14 @@ def detect_intent(text: str) -> Optional[str]:
         return 'utak_stock'
     if any(k in t for k in ['売れ筋', 'bestseller', 'ベストセラー', '売上ランキング', '人気商品']):
         return 'utak_bestsellers'
+    if any(k in t for k in ['死に筋', 'dead stock', 'デッドストック', '売れ残り', '不良在庫']):
+        return 'dead_stock'
+    if any(k in t for k in ['オンライン売上', 'online sales', 'grab分析', 'grab売上', 'オンライン比較']):
+        return 'online_sales'
+    if any(k in t for k in ['時間帯', 'hourly', '時間別', 'ピーク時間', 'peak hour']):
+        return 'hourly_sales'
+    if any(k in t for k in ['セット販売', 'bundle', 'バンドル', '一緒に買', 'bought together', 'ペア']):
+        return 'bundle_suggestions'
     return None
 
 def is_bot_mentioned(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -3106,7 +3247,11 @@ HELP_TEXT = """🤖 話しかけてくれてありがとう！
 📤 UTAKのCSVファイルを送信 — 在庫・売上を自動取り込み
 📊 「売れ筋」— UTAK売上ランキング
 📦 「UTAK在庫」— 在庫サマリー表示
-🔍 「在庫分析」— AI仕入れ提案"""
+🔍 「在庫分析」— AI仕入れ提案
+⚠️ 「死に筋」— 売れ残り商品リスト
+📱 「オンライン売上」— Grab vs 店舗比較
+⏰ 「時間帯」— 時間帯別売上分析
+🛒 「セット販売」— 一緒に買われる商品ペア"""
 
 # ─── Main message handler ──────────────────────────────────
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3322,6 +3467,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == 'utak_analysis':           await cmd_utak_analysis(update, ctx)
     elif intent == 'utak_stock':              await cmd_utak_stock(update, ctx)
     elif intent == 'utak_bestsellers':        await cmd_utak_bestsellers(update, ctx)
+    elif intent == 'dead_stock':              await cmd_dead_stock(update, ctx)
+    elif intent == 'online_sales':            await cmd_online_sales(update, ctx)
+    elif intent == 'hourly_sales':            await cmd_hourly_sales(update, ctx)
+    elif intent == 'bundle_suggestions':      await cmd_bundle_suggestions(update, ctx)
     else:
         try:
             reply_text = await ai_chat(text)
@@ -3805,6 +3954,95 @@ async def cmd_utak_bestsellers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["📊 過去7日の売れ筋トップ20\n━━━━━━━━━━━━━━━━━━━"]
     for i, it in enumerate(top, 1):
         lines.append(f"{i}. {it['item_name']}（{it['category']}）\n   {it['total_qty']:.0f}個 / ₱{it['total_sales']:,.0f}")
+    sent = await update.message.reply_text("\n".join(lines))
+    save_bot_message(chat_id, sent.message_id)
+
+async def cmd_dead_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """14日以上売れていない在庫あり商品を表示。"""
+    chat_id = update.effective_chat.id
+    dead = get_dead_stock(chat_id, days=14)
+    if not dead:
+        sent = await update.message.reply_text("✅ 死に筋商品はありません（全商品が過去14日で売上あり）。")
+        save_bot_message(chat_id, sent.message_id)
+        return
+    total_val = sum(it.get('inv_value', 0) or 0 for it in dead)
+    lines = [f"⚠️ 死に筋アラート（14日以上売上なし）: {len(dead)}品\n在庫金額合計: ₱{total_val:,.0f}\n━━━━━━━━━━━━━━━━━━━"]
+    by_cat: dict = {}
+    for it in dead:
+        by_cat.setdefault(it['category'], []).append(it)
+    for cat, items in sorted(by_cat.items()):
+        cat_val = sum(it.get('inv_value', 0) or 0 for it in items)
+        lines.append(f"\n【{cat}】{len(items)}品 / ₱{cat_val:,.0f}")
+        for it in items[:5]:
+            opt = f" ({it['option']})" if it.get('option') else ""
+            val = f" ₱{it['inv_value']:,.0f}" if it.get('inv_value') else ""
+            lines.append(f"  • {it['item_name']}{opt}: {it['stock']:.0f}個{val}")
+        if len(items) > 5:
+            lines.append(f"  ...他{len(items)-5}品")
+    lines.append(f"\n💡 値下げ・セット販売・廃棄を検討してください")
+    sent = await update.message.reply_text("\n".join(lines))
+    save_bot_message(chat_id, sent.message_id)
+
+async def cmd_online_sales(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """GrabMart/GrabFood vs 店舗売上を比較。"""
+    chat_id = update.effective_chat.id
+    data = get_online_vs_store_sales(chat_id, days=7)
+    store = data['store']
+    online = data['online']
+    total_sales = store['sales'] + online['sales']
+    if total_sales == 0:
+        sent = await update.message.reply_text("📊 売上データがありません。UTAKのTransactions CSVを送ってください。")
+        save_bot_message(chat_id, sent.message_id)
+        return
+    online_pct = online['sales'] / total_sales * 100 if total_sales > 0 else 0
+    store_pct = store['sales'] / total_sales * 100 if total_sales > 0 else 0
+    lines = [f"📊 Online vs Store Sales (Past 7 Days)\n━━━━━━━━━━━━━━━━━━━"]
+    lines.append(f"\n🏪 Store: ₱{store['sales']:,.0f} ({store_pct:.0f}%) | {store['qty']:.0f} items")
+    lines.append(f"📱 Online: ₱{online['sales']:,.0f} ({online_pct:.0f}%) | {online['qty']:.0f} items")
+    if online['by_platform']:
+        lines.append(f"\n📱 Online Breakdown:")
+        for platform, pdata in sorted(online['by_platform'].items(), key=lambda x: x[1]['sales'], reverse=True):
+            lines.append(f"  • {platform}: ₱{pdata['sales']:,.0f} / {pdata['qty']:.0f} items")
+    lines.append(f"\n💰 Total: ₱{total_sales:,.0f}")
+    sent = await update.message.reply_text("\n".join(lines))
+    save_bot_message(chat_id, sent.message_id)
+
+async def cmd_hourly_sales(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """時間帯別売れ筋を表示。"""
+    chat_id = update.effective_chat.id
+    hourly = get_hourly_sales(chat_id, days=7)
+    if not hourly:
+        sent = await update.message.reply_text("📊 売上データがありません。")
+        save_bot_message(chat_id, sent.message_id)
+        return
+    lines = ["⏰ Sales by Hour (Past 7 Days)\n━━━━━━━━━━━━━━━━━━━"]
+    max_sales = max(h['sales'] for h in hourly) if hourly else 1
+    for h in hourly:
+        bar_len = int(h['sales'] / max_sales * 10) if max_sales > 0 else 0
+        bar = '█' * bar_len + '░' * (10 - bar_len)
+        top_str = ', '.join(f"{name}({qty:.0f})" for name, qty in h['top_items'][:2])
+        lines.append(f"{h['label']} {bar} ₱{h['sales']:,.0f}")
+        if top_str:
+            lines.append(f"       Top: {top_str}")
+    # Find peak hours
+    peak = sorted(hourly, key=lambda x: x['sales'], reverse=True)[:3]
+    peak_labels = ', '.join(h['label'].strip() for h in peak)
+    lines.append(f"\n🔥 Peak hours: {peak_labels}")
+    sent = await update.message.reply_text("\n".join(lines))
+    save_bot_message(chat_id, sent.message_id)
+
+async def cmd_bundle_suggestions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """一緒に買われている商品ペアを表示。"""
+    chat_id = update.effective_chat.id
+    pairs = get_frequently_bought_together(chat_id, days=14, min_count=2)
+    if not pairs:
+        sent = await update.message.reply_text("📊 セット販売データが不足しています。もう少し売上データが溜まるとペアが見えてきます。")
+        save_bot_message(chat_id, sent.message_id)
+        return
+    lines = ["🛒 Frequently Bought Together (Past 14 Days)\n━━━━━━━━━━━━━━━━━━━"]
+    for i, p in enumerate(pairs, 1):
+        lines.append(f"{i}. {p['item_a']}\n   + {p['item_b']}\n   → {p['count']} times together")
+    lines.append(f"\n💡 Consider bundle discounts for these pairs!")
     sent = await update.message.reply_text("\n".join(lines))
     save_bot_message(chat_id, sent.message_id)
 
