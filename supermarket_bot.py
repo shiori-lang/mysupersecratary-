@@ -753,56 +753,28 @@ def get_utak_sales_top(chat_id: int, days: int = 7, limit: int = 30) -> list[dic
     return items
 
 def get_daily_sales_report(chat_id: int, target_date: str = None) -> str:
-    """前日の営業サマリーを生成。target_dateはYYYY-MM-DD形式。"""
+    """前日の商品インサイトを生成。target_dateはYYYY-MM-DD形式。"""
     if not target_date:
         target_date = (datetime.now(PHT) - timedelta(days=1)).strftime('%Y-%m-%d')
-    # Compare date: same weekday last week
     target_dt = datetime.strptime(target_date, '%Y-%m-%d')
-    last_week_date = (target_dt - timedelta(days=7)).strftime('%Y-%m-%d')
     conn = get_conn()
     c = conn.cursor()
 
-    # Yesterday's totals
-    c.execute('''SELECT COUNT(DISTINCT transaction_id) as txns,
-                        SUM(gross_price) as total_sales,
-                        SUM(qty) as total_items,
-                        SUM(cost) as total_cost
-                 FROM utak_sales WHERE chat_id=? AND sale_date=?''',
+    # Check data exists
+    c.execute('SELECT COUNT(*) FROM utak_sales WHERE chat_id=? AND sale_date=?',
               (chat_id, target_date))
-    row = c.fetchone()
-    if not row or not row[1]:
+    if c.fetchone()[0] == 0:
         conn.close()
         return f"📊 No sales data for {target_date}"
-    txns, total_sales, total_items, total_cost = row[0] or 0, row[1] or 0, row[2] or 0, row[3] or 0
-
-    # Last week same day totals
-    c.execute('''SELECT SUM(gross_price) FROM utak_sales
-                 WHERE chat_id=? AND sale_date=?''', (chat_id, last_week_date))
-    lw_row = c.fetchone()
-    lw_sales = lw_row[0] if lw_row and lw_row[0] else 0
-
-    # By payment type
-    c.execute('''SELECT payment_type, SUM(gross_price) as total
-                 FROM utak_sales WHERE chat_id=? AND sale_date=? AND payment_type != ''
-                 GROUP BY payment_type ORDER BY total DESC''',
-              (chat_id, target_date))
-    payments = c.fetchall()
-
-    # By category
-    c.execute('''SELECT category, SUM(gross_price) as total, SUM(qty) as qty
-                 FROM utak_sales WHERE chat_id=? AND sale_date=?
-                 GROUP BY category ORDER BY total DESC LIMIT 5''',
-              (chat_id, target_date))
-    top_cats = c.fetchall()
 
     # Top 5 items
-    c.execute('''SELECT item_name, SUM(qty) as total_qty, SUM(gross_price) as total_sales
+    c.execute('''SELECT item_name, SUM(qty) as total_qty
                  FROM utak_sales WHERE chat_id=? AND sale_date=?
                  GROUP BY item_name ORDER BY total_qty DESC LIMIT 5''',
               (chat_id, target_date))
     top_items = c.fetchall()
 
-    # First time sold: items sold yesterday but never before
+    # First time sold: items sold on target_date but never before
     c.execute('''SELECT item_name, SUM(qty) as qty FROM utak_sales
                  WHERE chat_id=? AND sale_date=?
                  AND item_name NOT IN (
@@ -813,7 +785,7 @@ def get_daily_sales_report(chat_id: int, target_date: str = None) -> str:
               (chat_id, target_date, chat_id, target_date))
     new_items = c.fetchall()
 
-    # Slowing down: sold in last 7 days avg > 0.5/day but 0 yesterday
+    # Slowing down: avg > 0.5/day in prior 7 days but 0 on target_date
     week_start = (target_dt - timedelta(days=7)).strftime('%Y-%m-%d')
     c.execute('''SELECT item_name, SUM(qty) / 7.0 as daily_avg FROM utak_sales
                  WHERE chat_id=? AND sale_date >= ? AND sale_date < ?
@@ -828,9 +800,9 @@ def get_daily_sales_report(chat_id: int, target_date: str = None) -> str:
     slowing.sort(key=lambda x: x[1], reverse=True)
 
     # Cashier performance
-    c.execute('''SELECT cashier, COUNT(DISTINCT transaction_id) as txns, SUM(gross_price) as total
+    c.execute('''SELECT cashier, COUNT(DISTINCT transaction_id) as txns
                  FROM utak_sales WHERE chat_id=? AND sale_date=? AND cashier != ''
-                 GROUP BY cashier ORDER BY total DESC''',
+                 GROUP BY cashier ORDER BY txns DESC''',
               (chat_id, target_date))
     cashiers = c.fetchall()
 
@@ -838,56 +810,27 @@ def get_daily_sales_report(chat_id: int, target_date: str = None) -> str:
 
     # Build report
     weekday = target_dt.strftime('%A')
-    lines = [f"📊 Daily Sales Report — {target_date} ({weekday})\n━━━━━━━━━━━━━━━━━━━"]
+    lines = [f"📊 Daily Product Insights — {target_date} ({weekday})\n━━━━━━━━━━━━━━━━━━━"]
 
-    # Totals + comparison
-    profit = total_sales - total_cost
-    lines.append(f"\n💰 Total Sales: ₱{total_sales:,.0f}")
-    if lw_sales > 0:
-        change = (total_sales - lw_sales) / lw_sales * 100
-        arrow = "📈" if change > 0 else "📉"
-        lines.append(f"{arrow} vs Last {weekday}: {change:+.0f}%")
-    lines.append(f"🧾 Transactions: {txns}")
-    lines.append(f"📦 Items Sold: {total_items:.0f}")
-    if total_cost > 0:
-        lines.append(f"💵 Profit: ₱{profit:,.0f} (margin {profit/total_sales*100:.0f}%)")
-
-    # Payment breakdown
-    if payments:
-        lines.append(f"\n💳 Payment Breakdown:")
-        for ptype, total in payments:
-            pct = total / total_sales * 100 if total_sales > 0 else 0
-            lines.append(f"  • {ptype}: ₱{total:,.0f} ({pct:.0f}%)")
-
-    # Top categories
-    if top_cats:
-        lines.append(f"\n📂 Top Categories:")
-        for cat, total, qty in top_cats:
-            lines.append(f"  • {cat}: ₱{total:,.0f} ({qty:.0f} items)")
-
-    # Top items
     if top_items:
         lines.append(f"\n🏆 Top 5 Sellers:")
-        for i, (name, qty, sales) in enumerate(top_items, 1):
-            lines.append(f"  {i}. {name} ×{qty:.0f} (₱{sales:,.0f})")
+        for i, (name, qty) in enumerate(top_items, 1):
+            lines.append(f"  {i}. {name} ×{qty:.0f}")
 
-    # New items sold
     if new_items:
         lines.append(f"\n🆕 First Time Sold:")
         for name, qty in new_items:
             lines.append(f"  • {name} — sold {qty:.0f}")
 
-    # Slowing down
     if slowing[:5]:
-        lines.append(f"\n📉 Slowing Down (was selling, not yesterday):")
+        lines.append(f"\n📉 Slowing Down (was selling, stopped):")
         for name, avg in slowing[:5]:
             lines.append(f"  • {name} (was {avg:.1f}/day)")
 
-    # Cashier stats
-    if cashiers and len(cashiers) > 1:
-        lines.append(f"\n👤 Cashier Performance:")
-        for name, txn_count, total in cashiers:
-            lines.append(f"  • {name}: ₱{total:,.0f} ({txn_count} txns)")
+    if cashiers:
+        lines.append(f"\n👤 Cashier Sales:")
+        for name, txn_count in cashiers:
+            lines.append(f"  • {name}: {txn_count} txns")
 
     return "\n".join(lines)
 
