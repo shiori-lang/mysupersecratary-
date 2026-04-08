@@ -752,6 +752,145 @@ def get_utak_sales_top(chat_id: int, days: int = 7, limit: int = 30) -> list[dic
     conn.close()
     return items
 
+def get_daily_sales_report(chat_id: int, target_date: str = None) -> str:
+    """前日の営業サマリーを生成。target_dateはYYYY-MM-DD形式。"""
+    if not target_date:
+        target_date = (datetime.now(PHT) - timedelta(days=1)).strftime('%Y-%m-%d')
+    # Compare date: same weekday last week
+    target_dt = datetime.strptime(target_date, '%Y-%m-%d')
+    last_week_date = (target_dt - timedelta(days=7)).strftime('%Y-%m-%d')
+    conn = get_conn()
+    c = conn.cursor()
+
+    # Yesterday's totals
+    c.execute('''SELECT COUNT(DISTINCT transaction_id) as txns,
+                        SUM(gross_price) as total_sales,
+                        SUM(qty) as total_items,
+                        SUM(cost) as total_cost
+                 FROM utak_sales WHERE chat_id=? AND sale_date=?''',
+              (chat_id, target_date))
+    row = c.fetchone()
+    if not row or not row[1]:
+        conn.close()
+        return f"📊 No sales data for {target_date}"
+    txns, total_sales, total_items, total_cost = row[0] or 0, row[1] or 0, row[2] or 0, row[3] or 0
+
+    # Last week same day totals
+    c.execute('''SELECT SUM(gross_price) FROM utak_sales
+                 WHERE chat_id=? AND sale_date=?''', (chat_id, last_week_date))
+    lw_row = c.fetchone()
+    lw_sales = lw_row[0] if lw_row and lw_row[0] else 0
+
+    # By payment type
+    c.execute('''SELECT payment_type, SUM(gross_price) as total
+                 FROM utak_sales WHERE chat_id=? AND sale_date=? AND payment_type != ''
+                 GROUP BY payment_type ORDER BY total DESC''',
+              (chat_id, target_date))
+    payments = c.fetchall()
+
+    # By category
+    c.execute('''SELECT category, SUM(gross_price) as total, SUM(qty) as qty
+                 FROM utak_sales WHERE chat_id=? AND sale_date=?
+                 GROUP BY category ORDER BY total DESC LIMIT 5''',
+              (chat_id, target_date))
+    top_cats = c.fetchall()
+
+    # Top 5 items
+    c.execute('''SELECT item_name, SUM(qty) as total_qty, SUM(gross_price) as total_sales
+                 FROM utak_sales WHERE chat_id=? AND sale_date=?
+                 GROUP BY item_name ORDER BY total_qty DESC LIMIT 5''',
+              (chat_id, target_date))
+    top_items = c.fetchall()
+
+    # First time sold: items sold yesterday but never before
+    c.execute('''SELECT item_name, SUM(qty) as qty FROM utak_sales
+                 WHERE chat_id=? AND sale_date=?
+                 AND item_name NOT IN (
+                     SELECT DISTINCT item_name FROM utak_sales
+                     WHERE chat_id=? AND sale_date < ?
+                 )
+                 GROUP BY item_name ORDER BY qty DESC LIMIT 5''',
+              (chat_id, target_date, chat_id, target_date))
+    new_items = c.fetchall()
+
+    # Slowing down: sold in last 7 days avg > 0.5/day but 0 yesterday
+    week_start = (target_dt - timedelta(days=7)).strftime('%Y-%m-%d')
+    c.execute('''SELECT item_name, SUM(qty) / 7.0 as daily_avg FROM utak_sales
+                 WHERE chat_id=? AND sale_date >= ? AND sale_date < ?
+                 GROUP BY item_name HAVING daily_avg >= 0.5
+                 ORDER BY daily_avg DESC''',
+              (chat_id, week_start, target_date))
+    prev_sellers = {r[0]: r[1] for r in c.fetchall()}
+    c.execute('''SELECT DISTINCT item_name FROM utak_sales
+                 WHERE chat_id=? AND sale_date=?''', (chat_id, target_date))
+    sold_yesterday = {r[0] for r in c.fetchall()}
+    slowing = [(name, avg) for name, avg in prev_sellers.items() if name not in sold_yesterday]
+    slowing.sort(key=lambda x: x[1], reverse=True)
+
+    # Cashier performance
+    c.execute('''SELECT cashier, COUNT(DISTINCT transaction_id) as txns, SUM(gross_price) as total
+                 FROM utak_sales WHERE chat_id=? AND sale_date=? AND cashier != ''
+                 GROUP BY cashier ORDER BY total DESC''',
+              (chat_id, target_date))
+    cashiers = c.fetchall()
+
+    conn.close()
+
+    # Build report
+    weekday = target_dt.strftime('%A')
+    lines = [f"📊 Daily Sales Report — {target_date} ({weekday})\n━━━━━━━━━━━━━━━━━━━"]
+
+    # Totals + comparison
+    profit = total_sales - total_cost
+    lines.append(f"\n💰 Total Sales: ₱{total_sales:,.0f}")
+    if lw_sales > 0:
+        change = (total_sales - lw_sales) / lw_sales * 100
+        arrow = "📈" if change > 0 else "📉"
+        lines.append(f"{arrow} vs Last {weekday}: {change:+.0f}%")
+    lines.append(f"🧾 Transactions: {txns}")
+    lines.append(f"📦 Items Sold: {total_items:.0f}")
+    if total_cost > 0:
+        lines.append(f"💵 Profit: ₱{profit:,.0f} (margin {profit/total_sales*100:.0f}%)")
+
+    # Payment breakdown
+    if payments:
+        lines.append(f"\n💳 Payment Breakdown:")
+        for ptype, total in payments:
+            pct = total / total_sales * 100 if total_sales > 0 else 0
+            lines.append(f"  • {ptype}: ₱{total:,.0f} ({pct:.0f}%)")
+
+    # Top categories
+    if top_cats:
+        lines.append(f"\n📂 Top Categories:")
+        for cat, total, qty in top_cats:
+            lines.append(f"  • {cat}: ₱{total:,.0f} ({qty:.0f} items)")
+
+    # Top items
+    if top_items:
+        lines.append(f"\n🏆 Top 5 Sellers:")
+        for i, (name, qty, sales) in enumerate(top_items, 1):
+            lines.append(f"  {i}. {name} ×{qty:.0f} (₱{sales:,.0f})")
+
+    # New items sold
+    if new_items:
+        lines.append(f"\n🆕 First Time Sold:")
+        for name, qty in new_items:
+            lines.append(f"  • {name} — sold {qty:.0f}")
+
+    # Slowing down
+    if slowing[:5]:
+        lines.append(f"\n📉 Slowing Down (was selling, not yesterday):")
+        for name, avg in slowing[:5]:
+            lines.append(f"  • {name} (was {avg:.1f}/day)")
+
+    # Cashier stats
+    if cashiers and len(cashiers) > 1:
+        lines.append(f"\n👤 Cashier Performance:")
+        for name, txn_count, total in cashiers:
+            lines.append(f"  • {name}: ₱{total:,.0f} ({txn_count} txns)")
+
+    return "\n".join(lines)
+
 def get_utak_inventory_summary(chat_id: int) -> str:
     """最新UTAKインベントリのカテゴリ別サマリーをテキストで返す。"""
     conn = get_conn()
@@ -3185,6 +3324,8 @@ def detect_intent(text: str) -> Optional[str]:
     if any(k in t for k in ['注文履歴', '注文csv', '注文 csv', 'order history', 'order csv']):
         return 'order_history_csv'
     # UTAK intents
+    if any(k in t for k in ['日報', 'daily report', '昨日の売上', 'yesterday', '営業レポート', 'daily sales']):
+        return 'daily_report'
     if any(k in t for k in ['在庫分析', 'utak分析', '仕入れ分析', 'reorder', '発注分析']):
         return 'utak_analysis'
     if any(k in t for k in ['utak在庫', 'utak stock', '在庫サマリー', 'pos在庫']):
@@ -3246,6 +3387,7 @@ HELP_TEXT = """🤖 話しかけてくれてありがとう！
 📤 UTAKのCSVファイルを送信 — 在庫・売上を自動取り込み
 📊 「売れ筋」— UTAK売上ランキング
 📦 「UTAK在庫」— 在庫サマリー表示
+📊 「日報」— 前日の売上サマリー
 🔍 「在庫分析」— AI仕入れ提案
 ⚠️ 「死に筋」— 売れ残り商品リスト
 📱 「オンライン売上」— Grab vs 店舗比較
@@ -3463,6 +3605,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif intent == 'inventory_check':          await cmd_inventory(update, ctx)
     elif intent == 'inventory_update':         await cmd_update_inventory(update, ctx, text)
     elif intent == 'order_history_csv':        await cmd_order_history_csv(update, ctx)
+    elif intent == 'daily_report':             await cmd_daily_report(update, ctx)
     elif intent == 'utak_analysis':           await cmd_utak_analysis(update, ctx)
     elif intent == 'utak_stock':              await cmd_utak_stock(update, ctx)
     elif intent == 'utak_bestsellers':        await cmd_utak_bestsellers(update, ctx)
@@ -3935,6 +4078,14 @@ async def cmd_utak_analysis(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     result = await generate_utak_reorder_ai(chat_id)
     await sent.edit_text(result)
 
+async def cmd_daily_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """昨日の営業サマリーを表示。"""
+    chat_id = update.effective_chat.id
+    yesterday = (datetime.now(PHT) - timedelta(days=1)).strftime('%Y-%m-%d')
+    report = get_daily_sales_report(chat_id, yesterday)
+    sent = await update.message.reply_text(report)
+    save_bot_message(chat_id, sent.message_id)
+
 async def cmd_utak_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """UTAKの在庫サマリーを表示。"""
     chat_id = update.effective_chat.id
@@ -4146,20 +4297,31 @@ async def utak_auto_sync(context):
             await browser.close()
         # Notify — only alert items that are selling (use reorder list)
         now = datetime.now(PHT).strftime('%Y-%m-%d %H:%M')
+        # Send sync status
+        sync_msg = f"🔄 UTAK Auto-Sync Complete ({now})\n" + "\n".join(results)
+        await context.bot.send_message(chat_id=chat_id, text=sync_msg)
+
+        # Send daily sales report
+        yesterday = (datetime.now(PHT) - timedelta(days=1)).strftime('%Y-%m-%d')
+        daily_report = get_daily_sales_report(chat_id, yesterday)
+        await context.bot.send_message(chat_id=chat_id, text=daily_report)
+
+        # Send stock alerts (only selling items)
         reorder = get_utak_reorder_list(chat_id)
         urgent = [r for r in reorder if r['priority'] == '🔴']
         warning = [r for r in reorder if r['priority'] == '🟡']
-        msg = f"🔄 UTAK Auto-Sync Complete ({now})\n" + "\n".join(results)
-        if urgent:
-            msg += f"\n\n🔴 URGENT — selling fast, low stock: {len(urgent)} items"
-            for it in urgent[:5]:
-                stock_str = f"{it['stock']:.0f} left" if it['stock'] > 0 else "OUT OF STOCK"
-                msg += f"\n  • {it['item_name']}: {stock_str} ({it['daily_rate']:.1f}/day)"
-        if warning:
-            msg += f"\n\n🟡 WARNING — restock soon: {len(warning)} items"
-            for it in warning[:5]:
-                msg += f"\n  • {it['item_name']}: {it['stock']:.0f} left ({it['days_left']:.0f} days)"
-        await context.bot.send_message(chat_id=chat_id, text=msg)
+        if urgent or warning:
+            alert = "⚠️ Stock Alert\n━━━━━━━━━━━━━━━━━━━"
+            if urgent:
+                alert += f"\n\n🔴 URGENT — selling fast, low stock: {len(urgent)} items"
+                for it in urgent[:8]:
+                    stock_str = f"{it['stock']:.0f} left" if it['stock'] > 0 else "OUT OF STOCK"
+                    alert += f"\n  • {it['item_name']}: {stock_str} ({it['daily_rate']:.1f}/day, {it['days_left']:.0f}d left)"
+            if warning:
+                alert += f"\n\n🟡 WARNING — restock within 7 days: {len(warning)} items"
+                for it in warning[:8]:
+                    alert += f"\n  • {it['item_name']}: {it['stock']:.0f} left ({it['days_left']:.0f}d)"
+            await context.bot.send_message(chat_id=chat_id, text=alert)
     except Exception as e:
         logger.error(f"UTAK auto-sync failed: {e}")
         try:
