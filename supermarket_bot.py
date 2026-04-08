@@ -4111,11 +4111,23 @@ async def utak_auto_sync(context):
             except Exception as e:
                 results.append(f"❌ 在庫取得失敗: {e}")
                 logger.error(f"UTAK inventory sync failed: {e}")
-            # Download Transactions CSV
+            # Download Transactions CSV (set date to yesterday)
             try:
                 await _dismiss_modals()
                 await page.click('a[href="/transactions"]')
                 await asyncio.sleep(6)
+                await _dismiss_modals()
+                # Set date range to yesterday (since sync runs at 01:00)
+                yesterday = (datetime.now(PHT) - timedelta(days=1)).strftime('%Y-%m-%d')
+                date_inputs = await page.query_selector_all('input[type=date]')
+                if len(date_inputs) >= 2:
+                    await date_inputs[0].fill(yesterday)  # From
+                    await date_inputs[1].fill(yesterday)  # To
+                    # Click Go! button to apply filter
+                    go_btn = page.locator('button:has-text("Go!")')
+                    if await go_btn.count() > 0:
+                        await go_btn.click()
+                        await asyncio.sleep(4)
                 await _dismiss_modals()
                 async with page.expect_download(timeout=30000) as dl_info:
                     await page.click('button:has-text("Download")')
@@ -4126,21 +4138,27 @@ async def utak_auto_sync(context):
                     reader = csv.DictReader(f)
                     rows = list(reader)
                 txn_count = import_utak_sales_csv(chat_id, rows)
-                results.append(f"💰 売上: {txn_count}件")
-                logger.info(f"UTAK sales sync: {txn_count} items")
+                results.append(f"💰 売上({yesterday}): {txn_count}件")
+                logger.info(f"UTAK sales sync ({yesterday}): {txn_count} items")
             except Exception as e:
                 results.append(f"❌ 売上取得失敗: {e}")
                 logger.error(f"UTAK sales sync failed: {e}")
             await browser.close()
-        # Notify
+        # Notify — only alert items that are selling (use reorder list)
         now = datetime.now(PHT).strftime('%Y-%m-%d %H:%M')
-        summary = get_utak_inventory_summary(chat_id)
-        low = get_utak_low_stock(chat_id, threshold=5)
-        msg = f"🔄 UTAK自動同期完了（{now}）\n" + "\n".join(results)
-        if low:
-            msg += f"\n\n🟡 在庫残少: {len(low)}品"
-            for it in low[:5]:
-                msg += f"\n  • {it['item_name']}: 残{it['ending']:.0f}個"
+        reorder = get_utak_reorder_list(chat_id)
+        urgent = [r for r in reorder if r['priority'] == '🔴']
+        warning = [r for r in reorder if r['priority'] == '🟡']
+        msg = f"🔄 UTAK Auto-Sync Complete ({now})\n" + "\n".join(results)
+        if urgent:
+            msg += f"\n\n🔴 URGENT — selling fast, low stock: {len(urgent)} items"
+            for it in urgent[:5]:
+                stock_str = f"{it['stock']:.0f} left" if it['stock'] > 0 else "OUT OF STOCK"
+                msg += f"\n  • {it['item_name']}: {stock_str} ({it['daily_rate']:.1f}/day)"
+        if warning:
+            msg += f"\n\n🟡 WARNING — restock soon: {len(warning)} items"
+            for it in warning[:5]:
+                msg += f"\n  • {it['item_name']}: {it['stock']:.0f} left ({it['days_left']:.0f} days)"
         await context.bot.send_message(chat_id=chat_id, text=msg)
     except Exception as e:
         logger.error(f"UTAK auto-sync failed: {e}")
