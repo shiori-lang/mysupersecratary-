@@ -1590,16 +1590,22 @@ def set_translate_mode(chat_id: int, enabled: bool):
 async def translate_text(text: str) -> str:
     client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
     prompt = (
-        "Translate the following text. "
-        "If Japanese, translate to English. If English, translate to Japanese. "
-        "Return translation only, no explanation.\n\nText: " + text
+        "Translate the following text between Japanese and English.\n"
+        "- If the text is in Japanese, translate to English.\n"
+        "- If the text is in English, translate to Japanese.\n"
+        "- If the text is in any other language (Tagalog, etc.) or contains "
+        "  no translatable content (only numbers/symbols/emojis), return exactly: SKIP\n"
+        "Return ONLY the translation (or SKIP), no explanation.\n\nText: " + text
     )
     resp = await client.messages.create(
         model="claude-opus-4-5",
         max_tokens=1000,
         messages=[{"role": "user", "content": prompt}]
     )
-    return resp.content[0].text.strip()
+    result = resp.content[0].text.strip()
+    if result == 'SKIP':
+        return text  # caller will skip when result == original
+    return result
 
 async def ai_chat(text: str) -> str:
     client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
@@ -3477,24 +3483,27 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pass
         return
 
-    # 2) Translation mode
-    if get_translate_mode(chat_id) and not is_supermarket_report(text):
-        if any(k in text.lower() for k in ['翻訳終了', 'translate off']):
-            set_translate_mode(chat_id, False)
-            sent = await update.message.reply_text("🌐 Translation mode OFF.")
-            save_bot_message(chat_id, sent.message_id)
-            return
+    # 2) Auto-translation: always ON for all groups (skip bot's own messages, reports, commands)
+    if not is_supermarket_report(text):
         # @メンション付きのコマンドは翻訳せずコマンド処理に回す
         if is_bot_mentioned(update, ctx) and detect_intent(text) is not None:
             pass  # fall through to command processing
         else:
-            try:
-                translated = await translate_text(text)
-                sent = await update.message.reply_text(f"🌐 {translated}")
-                save_bot_message(chat_id, sent.message_id)
-            except Exception as e:
-                logger.error(f"Translation error: {e}")
-            return
+            # Skip very short messages (emojis, single words like "ok", "yes")
+            if len(text.strip()) >= 2:
+                try:
+                    translated = await translate_text(text)
+                    # Only send if translation differs from original (avoid same-language echo)
+                    if translated.strip().lower() != text.strip().lower():
+                        sent = await update.message.reply_text(f"🌐 {translated}",
+                                                                reply_to_message_id=update.message.message_id)
+                        save_bot_message(chat_id, sent.message_id)
+                except Exception as e:
+                    logger.error(f"Translation error: {e}")
+            # Don't return — allow other handlers (intents, commands) to run as well
+            # But if the message is purely conversational, skip further processing
+            if not is_bot_mentioned(update, ctx) and detect_intent(text) is None:
+                return
 
     # 3) Only respond when bot is mentioned
     if not is_bot_mentioned(update, ctx):
