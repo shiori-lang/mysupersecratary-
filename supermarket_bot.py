@@ -1596,10 +1596,13 @@ async def translate_text(text: str) -> str:
         "- If the text contains no translatable content (only numbers/symbols/emojis), return exactly: SKIP\n"
         "Return ONLY the translation (or SKIP), no explanation.\n\nText: " + text
     )
-    resp = await client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=1000,
-        messages=[{"role": "user", "content": prompt}]
+    resp = await asyncio.wait_for(
+        client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}]
+        ),
+        timeout=15,
     )
     result = resp.content[0].text.strip()
     if result == 'SKIP':
