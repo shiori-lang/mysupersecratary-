@@ -4378,7 +4378,7 @@ def main():
         logger.info(f"RAW UPDATE | chat={chat_id} | msg_type={msg_type} | preview={text_preview!r}")
     app.add_handler(TypeHandler(Update, _log_raw_update), group=-1)
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.VIDEO) & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(handle_procurement_callback, pattern=r'^proc_'))
 
