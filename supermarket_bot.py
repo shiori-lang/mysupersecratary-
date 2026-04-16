@@ -1590,11 +1590,10 @@ def set_translate_mode(chat_id: int, enabled: bool):
 async def translate_text(text: str) -> str:
     client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
     prompt = (
-        "Translate the following text between Japanese and English.\n"
-        "- If the text is in Japanese, translate to English.\n"
-        "- If the text is in English, translate to Japanese.\n"
-        "- If the text is in any other language (Tagalog, etc.) or contains "
-        "  no translatable content (only numbers/symbols/emojis), return exactly: SKIP\n"
+        "Translate the following text to Japanese.\n"
+        "- If the text is already in Japanese, translate to English instead.\n"
+        "- Handle any language (English, Tagalog, mixed languages, etc.) — always translate to Japanese.\n"
+        "- If the text contains no translatable content (only numbers/symbols/emojis), return exactly: SKIP\n"
         "Return ONLY the translation (or SKIP), no explanation.\n\nText: " + text
     )
     resp = await client.messages.create(
