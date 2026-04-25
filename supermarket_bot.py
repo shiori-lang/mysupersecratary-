@@ -3492,25 +3492,19 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # 2) Auto-translation: always ON for all groups (skip bot's own messages, reports, commands)
     if not is_supermarket_report(text):
-        # @メンション付きのコマンドは翻訳せずコマンド処理に回す
-        if is_bot_mentioned(update, ctx) and detect_intent(text) is not None:
-            pass  # fall through to command processing
-        else:
-            # Skip very short messages (emojis, single words like "ok", "yes")
-            if len(text.strip()) >= 2:
-                try:
-                    translated = await translate_text(text)
-                    # Only send if translation differs from original (avoid same-language echo)
-                    if translated.strip().lower() != text.strip().lower():
-                        sent = await update.message.reply_text(f"🌐 {translated}",
-                                                                reply_to_message_id=update.message.message_id)
-                        save_bot_message(chat_id, sent.message_id)
-                except Exception as e:
-                    logger.error(f"Translation error: {e}")
-            # Don't return — allow other handlers (intents, commands) to run as well
-            # But if the message is purely conversational, skip further processing
-            if not is_bot_mentioned(update, ctx) and detect_intent(text) is None:
-                return
+        # Translate all messages (short messages excluded)
+        if len(text.strip()) >= 2:
+            try:
+                translated = await translate_text(text)
+                if translated.strip().lower() != text.strip().lower():
+                    sent = await update.message.reply_text(f"🌐 {translated}",
+                                                            reply_to_message_id=update.message.message_id)
+                    save_bot_message(chat_id, sent.message_id)
+            except Exception as e:
+                logger.error(f"Translation error: {e}")
+        # If bot is NOT mentioned, stop here — only translate, nothing else
+        if not is_bot_mentioned(update, ctx):
+            return
 
     # 3) Only respond when bot is mentioned
     if not is_bot_mentioned(update, ctx):
